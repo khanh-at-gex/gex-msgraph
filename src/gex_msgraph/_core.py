@@ -26,16 +26,14 @@ _BACKOFF_CAP = 30.0
 
 
 def _load_account_env(name: str) -> dict[str, str]:
-    """Read MS_<NAME>_* env vars, validate required, return as dict."""
+    """Read MS_<NAME>_* env vars, return as dict."""
     prefix = f"MS_{name.upper()}_"
-    required = ["CLIENT_ID", "CLIENT_SECRET", "TENANT_ID", "USERNAME", "PASSWORD"]
 
     res: dict[str, str] = {}
-    for req in required:
+    for req in ["CLIENT_ID", "CLIENT_SECRET", "TENANT_ID", "USERNAME", "PASSWORD"]:
         val = os.environ.get(prefix + req)
-        if not val:
-            raise KeyError(prefix + req)
-        res[req.lower()] = val
+        if val:
+            res[req.lower()] = val
 
     res["default_site_id"] = os.environ.get(prefix + "DEFAULT_SITE_ID", "")
     res["default_drive_id"] = os.environ.get(prefix + "DEFAULT_DRIVE_ID", "")
@@ -92,23 +90,54 @@ class _TokenProvider:
 
 
 class GraphClient:
-    def __init__(self, account: str) -> None:
-        self.account = account
-        cfg = _load_account_env(account)
-        self._provider = _TokenProvider(
-            client_id=cfg["client_id"],
-            client_secret=cfg["client_secret"],
-            tenant_id=cfg["tenant_id"],
-            username=cfg["username"],
-            password=cfg["password"],
-        )
-        self._default_drive_id = cfg["default_drive_id"]
+    def __init__(
+        self,
+        account: str | None = None,
+        *,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        tenant_id: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        default_site_id: str | None = None,
+        default_drive_id: str | None = None,
+        max_concurrent: int | None = None,
+        request_timeout: float | None = None,
+    ) -> None:
+        self.account = account or "custom"
+        cfg = _load_account_env(account) if account else {}
 
-        timeout = float(cfg["request_timeout"])
-        max_concurrent = int(cfg["max_concurrent"])
+        resolved_client_id = client_id or cfg.get("client_id")
+        resolved_client_secret = client_secret or cfg.get("client_secret")
+        resolved_tenant_id = tenant_id or cfg.get("tenant_id")
+        resolved_username = username or cfg.get("username")
+        resolved_password = password or cfg.get("password")
+
+        if not resolved_client_id:
+            raise KeyError(f"MS_{self.account.upper()}_CLIENT_ID" if account else "client_id")
+        if not resolved_client_secret:
+            raise KeyError(f"MS_{self.account.upper()}_CLIENT_SECRET" if account else "client_secret")
+        if not resolved_tenant_id:
+            raise KeyError(f"MS_{self.account.upper()}_TENANT_ID" if account else "tenant_id")
+        if not resolved_username:
+            raise KeyError(f"MS_{self.account.upper()}_USERNAME" if account else "username")
+        if not resolved_password:
+            raise KeyError(f"MS_{self.account.upper()}_PASSWORD" if account else "password")
+
+        self._provider = _TokenProvider(
+            client_id=resolved_client_id,
+            client_secret=resolved_client_secret,
+            tenant_id=resolved_tenant_id,
+            username=resolved_username,
+            password=resolved_password,
+        )
+        self._default_drive_id = default_drive_id if default_drive_id is not None else cfg.get("default_drive_id", "")
+
+        timeout = request_timeout if request_timeout is not None else float(cfg.get("request_timeout", _DEFAULT_TIMEOUT))
+        concurrent = max_concurrent if max_concurrent is not None else int(cfg.get("max_concurrent", _DEFAULT_MAX_CONCURRENT))
 
         self._client = httpx.AsyncClient(timeout=timeout)
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._semaphore = asyncio.Semaphore(concurrent)
 
     async def close(self) -> None:
         """Close the underlying httpx client. Safe to call multiple times."""

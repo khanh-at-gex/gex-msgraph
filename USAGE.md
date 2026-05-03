@@ -50,9 +50,22 @@ import asyncio
 from gex_msgraph import GraphClient
 
 async def main():
+    # Option 1: Use credentials automatically loaded from .env
     async with GraphClient("das_u1") as client:
         df = await client.read_excel(item_path="Reports/Q1.xlsx")
         print(df)
+
+    # Option 2: Provide credentials explicitly
+    explicit_client = GraphClient(
+        client_id="my_client_id",
+        client_secret="my_client_secret",
+        tenant_id="my_tenant_id",
+        username="my_username",
+        password="my_password",
+        default_drive_id="my_drive_id" # Optional
+    )
+    async with explicit_client:
+        df2 = await explicit_client.read_excel(item_path="Reports/Q2.xlsx")
 
 asyncio.run(main())
 ```
