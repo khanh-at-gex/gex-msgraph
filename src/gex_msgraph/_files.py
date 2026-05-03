@@ -15,6 +15,23 @@ class FileItem:
     modified: datetime
     is_folder: bool
 
+@dataclass
+class TreeNode:
+    item: FileItem | None
+    children: list["TreeNode"]
+    
+    def print(self, indent: int = 0) -> None:
+        """Print the tree structure visually."""
+        prefix = "  " * indent
+        if self.item:
+            icon = "📁" if self.item.is_folder else "📄"
+            print(f"{prefix}{icon} {self.item.name} ({self.item.size} bytes)")
+        else:
+            print(f"{prefix}📁 (Root)")
+            
+        for child in self.children:
+            child.print(indent + 1)
+
 def validate_identifier(
     item_path: str | None = None,
     share_url: str | None = None,

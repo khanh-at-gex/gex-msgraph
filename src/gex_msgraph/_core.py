@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     import pandas as pd
+    from gex_msgraph._files import TreeNode
 
 import httpx
 import msal
@@ -393,6 +394,131 @@ class GraphClient:
             
         return results
 
+    async def get_metadata(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> FileItem:
+        """Fetch metadata for a single item without downloading its content."""
+        from gex_msgraph._files import parse_drive_item
+        kind = validate_identifier(item_path, share_url, item_id)
+        value = item_path if kind == "path" else share_url if kind == "share" else item_id
+        assert value is not None
+        
+        url = build_resolution_url(kind, value, self._resolve_drive_id())
+        resp = await self._request("GET", url)
+        return parse_drive_item(resp.json())
+
+    async def delete_file(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> None:
+        """Delete an item."""
+        kind = validate_identifier(item_path, share_url, item_id)
+        value = item_path if kind == "path" else share_url if kind == "share" else item_id
+        assert value is not None
+        
+        url = build_resolution_url(kind, value, self._resolve_drive_id())
+        await self._request("DELETE", url)
+
+    async def move_file(
+        self,
+        source_path: str,
+        dest_folder_path: str | None = None,
+        new_name: str | None = None,
+    ) -> FileItem:
+        """Move or rename a file using paths."""
+        from gex_msgraph._files import parse_drive_item
+        import urllib.parse
+        
+        drive_id = self._resolve_drive_id()
+        source_clean = source_path.lstrip("/")
+        
+        encoded_source = urllib.parse.quote(source_clean)
+        url = f"/drives/{drive_id}/root:/{encoded_source}"
+        
+        payload: dict[str, Any] = {}
+        if dest_folder_path is not None:
+            dest_clean = dest_folder_path.lstrip("/")
+            payload["parentReference"] = {
+                "path": f"/drive/root:/{dest_clean}" if dest_clean else "/drive/root"
+            }
+        if new_name is not None:
+            payload["name"] = new_name
+            
+        if not payload:
+            raise ValueError("Must provide dest_folder_path or new_name")
+            
+        resp = await self._request("PATCH", url, json=payload)
+        return parse_drive_item(resp.json())
+
+    async def create_folder(self, folder_path: str) -> FileItem:
+        """Create a new folder."""
+        from gex_msgraph._files import parse_drive_item
+        import urllib.parse
+        
+        drive_id = self._resolve_drive_id()
+        clean_path = folder_path.lstrip("/")
+        
+        if "/" in clean_path:
+            parent, name = clean_path.rsplit("/", 1)
+            encoded_parent = urllib.parse.quote(parent)
+            url = f"/drives/{drive_id}/root:/{encoded_parent}:/children"
+        else:
+            name = clean_path
+            url = f"/drives/{drive_id}/root/children"
+            
+        payload = {
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "rename"
+        }
+        
+        resp = await self._request("POST", url, json=payload)
+        return parse_drive_item(resp.json())
+
+    async def list_excel_sheets(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> list[str]:
+        """List all worksheet names in an Excel file."""
+        kind = validate_identifier(item_path, share_url, item_id)
+        value = item_path if kind == "path" else share_url if kind == "share" else item_id
+        assert value is not None
+        
+        url = build_resolution_url(kind, value, self._resolve_drive_id()) + ":/workbook/worksheets"
+        resp = await self._request("GET", url)
+        return [str(sheet["name"]) for sheet in resp.json().get("value", [])]
+
+    async def get_folder_tree(self, folder_path: str = "") -> "TreeNode":
+        """Return a recursive tree representation of a folder."""
+        from gex_msgraph._files import TreeNode
+        
+        root_item = None
+        if folder_path:
+            root_item = await self.get_metadata(item_path=folder_path)
+            
+        root_node = TreeNode(item=root_item, children=[])
+        
+        async def _build_tree(path: str, node: TreeNode) -> None:
+            children_items = await self.list_files(path)
+            for child in children_items:
+                child_node = TreeNode(item=child, children=[])
+                node.children.append(child_node)
+                if child.is_folder:
+                    await _build_tree(child.path, child_node)
+                    
+        await _build_tree(folder_path, root_node)
+        return root_node
+
     async def upload(self, local_path: str | os.PathLike[str], remote_path: str) -> dict[str, Any]:
         """Upload a local file to remote_path. Returns the Graph driveItem dict."""
         import urllib.parse
@@ -460,6 +586,17 @@ class GraphClient:
         }
         url = f"/teams/{team_id}/channels/{channel_id}/messages"
         await self._request("POST", url, json=payload)
+
+    async def get_teams_messages(
+        self,
+        team_id: str,
+        channel_id: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Fetch incoming messages from a Teams channel."""
+        url = f"/teams/{team_id}/channels/{channel_id}/messages?$top={limit}"
+        resp = await self._request("GET", url)
+        return cast(list[dict[str, Any]], resp.json().get("value", []))
 
     def read_excel_sync(self, **kw: Any) -> "pd.DataFrame":
         return asyncio.run(self.read_excel(**kw))

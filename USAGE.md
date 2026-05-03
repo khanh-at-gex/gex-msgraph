@@ -79,13 +79,28 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Read Excel by path:** `await client.read_excel(item_path="Folder/File.xlsx")`
 - **Read Excel by share link:** `await client.read_excel(share_url="https://tenant.sharepoint.com/.../File.xlsx")`
 - **Read CSV:** `await client.read_csv(item_path="data.csv")`
-- **Download raw bytes:** `await client.download(item_path="image.png")`
+- **Bulk read:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
-- **Bulk read:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
+- **Download raw bytes:** `await client.download(item_path="image.png")`
 - **Upload:** `await client.upload("local.txt", "remote.txt")`
+
+### File & Folder Management
+- **Get File Metadata (Size, Date):** `meta = await client.get_metadata(item_path="File.xlsx")`
+- **Delete File:** `await client.delete_file(item_path="File.xlsx")`
+- **Move/Rename File:** `await client.move_file("Old.xlsx", dest_folder_path="Archive", new_name="New.xlsx")`
+- **Create Folder:** `await client.create_folder("NewFolder")`
+- **Print Folder Tree:** 
+  ```python
+  tree = await client.get_folder_tree("Reports")
+  tree.print()
+  ```
+- **List Excel Sheets (Without downloading):** `sheets = await client.list_excel_sheets(item_path="File.xlsx")`
+
+### Communications
 - **Send mail:** `await client.send_mail("test@test.com", "Subj", "Body")`
 - **Send Teams:** `await client.send_teams_message("team1", "chan1", "Hello")`
+- **Read Teams:** `msgs = await client.get_teams_messages("team1", "chan1", limit=10)`
 
 ## 8. Multi-account
 Instantiate two clients, e.g. `client1 = GraphClient("das_u1")` and `client2 = GraphClient("das_u2")`.
