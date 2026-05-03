@@ -1,0 +1,442 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+import httpx
+import msal
+
+from gex_msgraph._files import FileItem, build_resolution_url, validate_identifier
+
+logger = logging.getLogger("gex_msgraph")
+
+_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+_AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
+_DEFAULT_SCOPE = ["https://graph.microsoft.com/.default"]
+_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_MAX_CONCURRENT = 10
+_DEFAULT_MAX_RETRIES = 3
+_BACKOFF_CAP = 30.0
+
+
+def _load_account_env(name: str) -> dict[str, str]:
+    """Read MS_<NAME>_* env vars, validate required, return as dict."""
+    prefix = f"MS_{name.upper()}_"
+    required = ["CLIENT_ID", "CLIENT_SECRET", "TENANT_ID", "USERNAME", "PASSWORD"]
+
+    res: dict[str, str] = {}
+    for req in required:
+        val = os.environ.get(prefix + req)
+        if not val:
+            raise KeyError(prefix + req)
+        res[req.lower()] = val
+
+    res["default_site_id"] = os.environ.get(prefix + "DEFAULT_SITE_ID", "")
+    res["default_drive_id"] = os.environ.get(prefix + "DEFAULT_DRIVE_ID", "")
+    res["max_concurrent"] = os.environ.get(prefix + "MAX_CONCURRENT", str(_DEFAULT_MAX_CONCURRENT))
+    res["request_timeout"] = os.environ.get(prefix + "REQUEST_TIMEOUT", str(_DEFAULT_TIMEOUT))
+
+    return res
+
+
+def _compute_backoff(attempt: int, retry_after: str | None) -> float:
+    """Compute backoff seconds."""
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return min(float(2**attempt), _BACKOFF_CAP)
+
+
+class _TokenProvider:
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        tenant_id: str,
+        username: str,
+        password: str,
+    ) -> None:
+        self._username = username
+        self._password = password
+        self._app = msal.PublicClientApplication(
+            client_id=client_id,
+            authority=_AUTHORITY_TEMPLATE.format(tenant_id=tenant_id),
+        )
+
+    def get_token(self) -> str:
+        """Returns access token. Synchronous (MSAL is sync). Cached automatically."""
+        accounts = self._app.get_accounts(username=self._username)
+        if accounts:
+            result = self._app.acquire_token_silent(_DEFAULT_SCOPE, account=accounts[0])
+            if result and "access_token" in result:
+                return str(result["access_token"])
+
+        result = self._app.acquire_token_by_username_password(
+            username=self._username,
+            password=self._password,
+            scopes=_DEFAULT_SCOPE,
+        )
+        if "access_token" in result:
+            return str(result["access_token"])
+
+        err = result.get("error_description") or result.get("error") or "Unknown error"
+        raise RuntimeError(f"Token acquisition failed: {err}")
+
+
+class GraphClient:
+    def __init__(self, account: str) -> None:
+        self.account = account
+        cfg = _load_account_env(account)
+        self._provider = _TokenProvider(
+            client_id=cfg["client_id"],
+            client_secret=cfg["client_secret"],
+            tenant_id=cfg["tenant_id"],
+            username=cfg["username"],
+            password=cfg["password"],
+        )
+        self._default_drive_id = cfg["default_drive_id"]
+
+        timeout = float(cfg["request_timeout"])
+        max_concurrent = int(cfg["max_concurrent"])
+
+        self._client = httpx.AsyncClient(timeout=timeout)
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def close(self) -> None:
+        """Close the underlying httpx client. Safe to call multiple times."""
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "GraphClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    def _resolve_drive_id(self) -> str:
+        return self._default_drive_id if self._default_drive_id else "me"
+
+    async def _request(self, method: str, url: str, **kw: Any) -> httpx.Response:
+        if not url.startswith("http"):
+            url = _GRAPH_BASE + url
+
+        attempt = 0
+        while True:
+            token = await asyncio.to_thread(self._provider.get_token)
+            
+            headers = kw.pop("headers", {})
+            headers["Authorization"] = f"Bearer {token}"
+            kw["headers"] = headers
+
+            async with self._semaphore:
+                logger.debug("Graph request %s %s", method, url)
+                response = await self._client.request(method, url, **kw)
+                
+            status = response.status_code
+            logger.debug("Graph response %s %s -> %s", method, url, status)
+
+            if status < 400:
+                return response
+
+            if status == 429 or status >= 500:
+                if attempt >= _DEFAULT_MAX_RETRIES:
+                    logger.error("Graph request failed after %s attempts", attempt)
+                    response.raise_for_status()
+
+                backoff = _compute_backoff(attempt, response.headers.get("Retry-After"))
+                logger.info("Retrying %s %s in %.1fs (attempt %s)", method, url, backoff, attempt + 1)
+                await asyncio.sleep(backoff)
+                attempt += 1
+                continue
+
+            logger.error("Graph request failed %s: %s", status, response.text)
+            response.raise_for_status()
+
+    async def _get_download_url(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> str:
+        kind = validate_identifier(item_path, share_url, item_id)
+        value = item_path if kind == "path" else share_url if kind == "share" else item_id
+        assert value is not None
+
+        url = build_resolution_url(kind, value, self._resolve_drive_id())
+        resp = await self._request("GET", url)
+        data = resp.json()
+        download_url = data.get("@microsoft.graph.downloadUrl")
+        if not download_url:
+            raise RuntimeError(f"Could not resolve download URL for item: {value}")
+        return str(download_url)
+
+    async def _stream_to_bytes(self, url: str) -> bytes:
+        async with self._semaphore:
+            logger.debug("Streaming %s", url)
+            resp = await self._client.get(url)
+            resp.raise_for_status()
+            return await resp.aread()
+
+    async def _iter_paginated(self, url: str) -> AsyncIterator[dict[str, Any]]:
+        while url:
+            resp = await self._request("GET", url)
+            data = resp.json()
+            for item in data.get("value", []):
+                yield item
+            url = data.get("@odata.nextLink", "")
+
+    async def read_excel(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+        sheet: str | int = 0,
+        **read_excel_kwargs: Any,
+    ) -> "pd.DataFrame":
+        """Read an Excel file directly into a DataFrame. Streams via BytesIO."""
+        import io
+        import pandas as pd
+
+        data = await self.download(item_path=item_path, share_url=share_url, item_id=item_id)
+        buf = io.BytesIO(data)
+        return pd.read_excel(buf, sheet_name=sheet, **read_excel_kwargs)
+
+    async def read_csv(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+        **read_csv_kwargs: Any,
+    ) -> "pd.DataFrame":
+        """Read a CSV file directly into a DataFrame. Streams via BytesIO."""
+        import io
+        import pandas as pd
+
+        data = await self.download(item_path=item_path, share_url=share_url, item_id=item_id)
+        buf = io.BytesIO(data)
+        return pd.read_csv(buf, **read_csv_kwargs)
+
+    async def download(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> bytes:
+        """Return raw file bytes. Use for non-pandas parsing."""
+        url = await self._get_download_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
+        return await self._stream_to_bytes(url)
+
+    async def read_excel_many(
+        self,
+        paths: list[str],
+        *,
+        sheet: str | int = 0,
+        sheet_match: Literal["exact", "ci", "glob"] = "exact",
+        on_missing_sheet: Literal["raise", "skip", "warn"] = "raise",
+        on_error: Literal["raise", "skip", "warn"] = "raise",
+        add_source_column: bool = True,
+        max_concurrent: int | None = None,
+        **read_excel_kwargs: Any,
+    ) -> "pd.DataFrame":
+        """Read many Excel files concurrently and concat into one DataFrame."""
+        import io
+        import pandas as pd
+        from gex_msgraph._files import match_sheet_name
+
+        async def _process_one(path: str) -> pd.DataFrame | None:
+            try:
+                data = await self.download(item_path=path)
+                buf = io.BytesIO(data)
+                
+                xls = pd.ExcelFile(buf)
+                matched = match_sheet_name(xls.sheet_names, sheet, sheet_match)
+                
+                if matched is None:
+                    if on_missing_sheet == "raise":
+                        raise ValueError(f"Sheet '{sheet}' not found in {path}")
+                    elif on_missing_sheet == "warn":
+                        logger.warning("Sheet '%s' not found in %s", sheet, path)
+                        return None
+                    elif on_missing_sheet == "skip":
+                        return None
+
+                df = pd.read_excel(xls, sheet_name=matched, **read_excel_kwargs)
+                if add_source_column:
+                    df["_source"] = path
+                return df
+                
+            except Exception as e:
+                if on_error == "raise":
+                    raise
+                elif on_error == "warn":
+                    logger.warning("Failed to read %s: %s", path, e)
+                    return None
+                elif on_error == "skip":
+                    return None
+                return None
+
+        sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
+        
+        async def _bounded_process(path: str) -> pd.DataFrame | None:
+            if sem:
+                async with sem:
+                    return await _process_one(path)
+            return await _process_one(path)
+
+        tasks = [_bounded_process(p) for p in paths]
+        results = await asyncio.gather(*tasks)
+        
+        valid_dfs = [df for df in results if df is not None]
+        if not valid_dfs:
+            return pd.DataFrame()
+        return pd.concat(valid_dfs, ignore_index=True, sort=False)
+
+    async def walk(
+        self,
+        folder_path: str = "",
+        *,
+        pattern: str | None = None,
+        recursive: bool = True,
+    ) -> list[FileItem]:
+        """List files (not folders) under a folder. Recursive by default."""
+        import fnmatch
+        from gex_msgraph._files import parse_drive_item
+        
+        drive_id = self._resolve_drive_id()
+        clean_path = folder_path.lstrip("/")
+        
+        if clean_path:
+            base_url = f"/drives/{drive_id}/root:/{clean_path}:/children"
+        else:
+            base_url = f"/drives/{drive_id}/root/children"
+            
+        results: list[FileItem] = []
+        
+        async def _explore(url: str, current_path: str) -> None:
+            subfolders: list[tuple[str, str]] = []
+            
+            async for item in self._iter_paginated(url):
+                file_item = parse_drive_item(item, parent_path=current_path)
+                
+                if file_item.is_folder:
+                    if recursive:
+                        folder_url = f"/drives/{drive_id}/items/{file_item.id}/children"
+                        subfolders.append((folder_url, file_item.path))
+                else:
+                    if pattern is None or fnmatch.fnmatch(file_item.name, pattern):
+                        results.append(file_item)
+                        
+            tasks = [_explore(sub_url, sub_path) for sub_url, sub_path in subfolders]
+            if tasks:
+                await asyncio.gather(*tasks)
+
+        await _explore(base_url, clean_path)
+        return results
+
+    async def list_files(self, folder_path: str = "") -> list[FileItem]:
+        """List immediate children (files and folders) of one folder. Non-recursive."""
+        from gex_msgraph._files import parse_drive_item
+        
+        drive_id = self._resolve_drive_id()
+        clean_path = folder_path.lstrip("/")
+        
+        if clean_path:
+            url = f"/drives/{drive_id}/root:/{clean_path}:/children"
+        else:
+            url = f"/drives/{drive_id}/root/children"
+            
+        results: list[FileItem] = []
+        async for item in self._iter_paginated(url):
+            results.append(parse_drive_item(item, parent_path=clean_path))
+            
+        return results
+
+    async def upload(self, local_path: str | os.PathLike[str], remote_path: str) -> dict[str, Any]:
+        """Upload a local file to remote_path. Returns the Graph driveItem dict."""
+        import urllib.parse
+        from pathlib import Path
+        
+        local_p = Path(local_path)
+        if not local_p.is_file():
+            raise FileNotFoundError(f"File not found: {local_path}")
+            
+        drive_id = self._resolve_drive_id()
+        clean_remote = remote_path.lstrip("/")
+        encoded_path = urllib.parse.quote(clean_remote)
+        
+        url = f"/drives/{drive_id}/root:/{encoded_path}:/content"
+        
+        with open(local_p, "rb") as f:
+            data = f.read()
+            
+        resp = await self._request("PUT", url, content=data, headers={"Content-Type": "application/octet-stream"})
+        return cast(dict[str, Any], resp.json())
+
+    async def send_mail(
+        self,
+        to: str | list[str],
+        subject: str,
+        body: str,
+        *,
+        cc: str | list[str] | None = None,
+    ) -> None:
+        """Send a plain-text email from the account's mailbox."""
+        def _make_recipients(addrs: str | list[str]) -> list[dict[str, Any]]:
+            if isinstance(addrs, str):
+                addrs = [addrs]
+            return [{"emailAddress": {"address": a}} for a in addrs]
+            
+        payload: dict[str, Any] = {
+            "message": {
+                "subject": subject,
+                "body": {
+                    "contentType": "Text",
+                    "content": body,
+                },
+                "toRecipients": _make_recipients(to),
+            },
+            "saveToSentItems": "true"
+        }
+        
+        if cc:
+            payload["message"]["ccRecipients"] = _make_recipients(cc)
+            
+        await self._request("POST", "/users/me/sendMail", json=payload)
+
+    async def send_teams_message(
+        self,
+        team_id: str,
+        channel_id: str,
+        text: str,
+    ) -> None:
+        """Post a plain-text message to a Teams channel."""
+        payload = {
+            "body": {
+                "contentType": "Text",
+                "content": text
+            }
+        }
+        url = f"/teams/{team_id}/channels/{channel_id}/messages"
+        await self._request("POST", url, json=payload)
+
+    def read_excel_sync(self, **kw: Any) -> "pd.DataFrame":
+        return asyncio.run(self.read_excel(**kw))
+
+    def read_csv_sync(self, **kw: Any) -> "pd.DataFrame":
+        return asyncio.run(self.read_csv(**kw))
+
+    def download_sync(self, **kw: Any) -> bytes:
+        return asyncio.run(self.download(**kw))
