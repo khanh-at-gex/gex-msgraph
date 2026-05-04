@@ -11,7 +11,7 @@ async def test_init_missing_env(env_vars, monkeypatch):
 
 async def test_download(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt").mock(
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
             return_value=httpx.Response(200, json={"@microsoft.graph.downloadUrl": "https://download.url"})
         )
         rm.get("https://download.url").mock(
@@ -25,7 +25,7 @@ async def test_download(env_vars, mock_token):
 
 async def test_retry_429(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt")
+        route = rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt")
         route.side_effect = [
             httpx.Response(429, headers={"Retry-After": "0"}),
             httpx.Response(200, json={"@microsoft.graph.downloadUrl": "https://download.url"})
@@ -42,7 +42,7 @@ async def test_retry_429(env_vars, mock_token):
 
 async def test_retry_503(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt")
+        route = rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt")
         route.mock(return_value=httpx.Response(503))
         
         client = GraphClient("das_u1")
@@ -62,7 +62,7 @@ async def test_retry_503(env_vars, mock_token):
 
 async def test_no_retry_403(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt")
+        route = rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt")
         route.mock(return_value=httpx.Response(403))
         
         client = GraphClient("das_u1")
@@ -74,7 +74,7 @@ async def test_no_retry_403(env_vars, mock_token):
 
 async def test_walk_pagination(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route1 = rm.get("https://graph.microsoft.com/v1.0/drives/me/root/children")
+        route1 = rm.get("https://graph.microsoft.com/v1.0/me/drive/root/children")
         route1.mock(return_value=httpx.Response(200, json={
             "value": [{"name": "file1.txt", "size": 10}],
             "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2"
@@ -94,7 +94,7 @@ async def test_walk_pagination(env_vars, mock_token):
 
 async def test_send_mail(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.post("https://graph.microsoft.com/v1.0/users/me/sendMail")
+        route = rm.post("https://graph.microsoft.com/v1.0/me/sendMail")
         route.mock(return_value=httpx.Response(202))
         
         client = GraphClient("das_u1")
@@ -121,7 +121,7 @@ async def test_send_teams_message(env_vars, mock_token):
 
 def test_sync_wrappers(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt").mock(
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
             return_value=httpx.Response(200, json={"@microsoft.graph.downloadUrl": "https://download.url"})
         )
         rm.get("https://download.url").mock(
@@ -134,7 +134,7 @@ def test_sync_wrappers(env_vars, mock_token):
 
 async def test_get_metadata(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt")
+        route = rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt")
         route.mock(return_value=httpx.Response(200, json={"name": "file.txt", "size": 123}))
         
         client = GraphClient("das_u1")
@@ -145,7 +145,7 @@ async def test_get_metadata(env_vars, mock_token):
 
 async def test_delete_file(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.delete("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt")
+        route = rm.delete("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt")
         route.mock(return_value=httpx.Response(204))
         
         client = GraphClient("das_u1")
@@ -155,7 +155,7 @@ async def test_delete_file(env_vars, mock_token):
 
 async def test_move_file(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.patch("https://graph.microsoft.com/v1.0/drives/me/root:/file.txt")
+        route = rm.patch("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt")
         route.mock(return_value=httpx.Response(200, json={"name": "new.txt"}))
         
         client = GraphClient("das_u1")
@@ -168,7 +168,7 @@ async def test_move_file(env_vars, mock_token):
 
 async def test_create_folder(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.post("https://graph.microsoft.com/v1.0/drives/me/root:/parent:/children")
+        route = rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/parent:/children")
         route.mock(return_value=httpx.Response(201, json={"name": "child", "folder": {}}))
         
         client = GraphClient("das_u1")
@@ -179,7 +179,7 @@ async def test_create_folder(env_vars, mock_token):
 
 async def test_list_excel_sheets(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        route = rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/file.xlsx:/workbook/worksheets")
+        route = rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.xlsx:/workbook/worksheets")
         route.mock(return_value=httpx.Response(200, json={"value": [{"name": "Sheet1"}, {"name": "Sheet2"}]}))
         
         client = GraphClient("das_u1")
@@ -189,16 +189,16 @@ async def test_list_excel_sheets(env_vars, mock_token):
 
 async def test_get_folder_tree(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
-        rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/root").mock(
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/root").mock(
             return_value=httpx.Response(200, json={"name": "root", "folder": {}})
         )
-        rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/root:/children").mock(
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/root:/children").mock(
             return_value=httpx.Response(200, json={"value": [
                 {"name": "file.txt"},
                 {"name": "sub", "folder": {}}
             ]})
         )
-        rm.get("https://graph.microsoft.com/v1.0/drives/me/root:/root/sub:/children").mock(
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/root/sub:/children").mock(
             return_value=httpx.Response(200, json={"value": []})
         )
         
@@ -214,9 +214,83 @@ async def test_get_teams_messages(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
         route = rm.get("https://graph.microsoft.com/v1.0/teams/t1/channels/c1/messages?$top=10")
         route.mock(return_value=httpx.Response(200, json={"value": [{"id": "m1"}]}))
-        
+
         client = GraphClient("das_u1")
         async with client:
             res = await client.get_teams_messages("t1", "c1")
             assert len(res) == 1
             assert res[0]["id"] == "m1"
+
+
+async def test_explicit_drive_id_url_format(env_vars_with_drive, mock_token):
+    """Bug 1 regression: explicit DEFAULT_DRIVE_ID emits /drives/{id}/..., not /me/drive/..."""
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.get("https://graph.microsoft.com/v1.0/drives/b!abc/root:/file.txt")
+        route.mock(return_value=httpx.Response(200, json={"name": "file.txt", "size": 1}))
+
+        client = GraphClient("das_u1")
+        async with client:
+            meta = await client.get_metadata(item_path="file.txt")
+            assert meta.name == "file.txt"
+            assert route.called
+
+
+async def test_read_excel_many_missing_sheet_raise_overrides_on_error(env_vars, mock_token):
+    """Bug 4 regression: on_missing_sheet='raise' must raise even when on_error='skip'."""
+    import io
+    import openpyxl
+
+    # Build a real one-sheet xlsx in memory so pd.ExcelFile can open it.
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "OnlySheet"
+    ws["A1"] = "hello"
+    buf = io.BytesIO()
+    wb.save(buf)
+    xlsx_bytes = buf.getvalue()
+
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/f.xlsx").mock(
+            return_value=httpx.Response(200, json={"@microsoft.graph.downloadUrl": "https://dl.url"})
+        )
+        rm.get("https://dl.url").mock(return_value=httpx.Response(200, content=xlsx_bytes))
+
+        client = GraphClient("das_u1")
+        async with client:
+            with pytest.raises(ValueError, match="not found"):
+                await client.read_excel_many(
+                    ["f.xlsx"],
+                    sheet="DoesNotExist",
+                    on_missing_sheet="raise",
+                    on_error="skip",
+                )
+
+
+async def test_list_excel_sheets_by_item_id(env_vars, mock_token):
+    """Bug 3 regression: id-addressed list_excel_sheets uses /items/{id}/workbook/worksheets (no colon)."""
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.get("https://graph.microsoft.com/v1.0/me/drive/items/xyz/workbook/worksheets")
+        route.mock(return_value=httpx.Response(200, json={"value": [{"name": "S1"}]}))
+
+        client = GraphClient("das_u1")
+        async with client:
+            res = await client.list_excel_sheets(item_id="xyz")
+            assert res == ["S1"]
+
+
+async def test_list_excel_sheets_by_share_url(env_vars, mock_token):
+    """Bug 3 regression: share-addressed list_excel_sheets uses /shares/{enc}/driveItem/workbook/worksheets."""
+    from gex_msgraph._files import encode_share_url
+    share = "https://tenant.sharepoint.com/sites/x/Shared%20Documents/f.xlsx"
+    encoded = encode_share_url(share)
+
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.get(
+            f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem/workbook/worksheets"
+        )
+        route.mock(return_value=httpx.Response(200, json={"value": [{"name": "S1"}]}))
+
+        client = GraphClient("das_u1")
+        async with client:
+            res = await client.list_excel_sheets(share_url=share)
+            assert res == ["S1"]

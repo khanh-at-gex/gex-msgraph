@@ -10,6 +10,10 @@ def env_vars(monkeypatch):
     monkeypatch.setenv("MS_DAS_U1_PASSWORD", "fake_pass")
 
 @pytest.fixture
+def env_vars_with_drive(env_vars, monkeypatch):
+    monkeypatch.setenv("MS_DAS_U1_DEFAULT_DRIVE_ID", "b!abc")
+
+@pytest.fixture
 def mock_token(monkeypatch):
     from gex_msgraph._core import _TokenProvider
     monkeypatch.setattr(_TokenProvider, "__init__", lambda self, *args, **kwargs: None)

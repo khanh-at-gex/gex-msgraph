@@ -25,11 +25,14 @@ def test_encode_share_url():
     assert res.startswith("u!")
 
 def test_build_resolution_url():
-    assert build_resolution_url("path", "file.xlsx", "me") == "/drives/me/root:/file.xlsx"
-    assert build_resolution_url("id", "xyz", "drive1") == "/drives/drive1/items/xyz"
+    # Default OneDrive: drive_root="/me/drive"
+    assert build_resolution_url("path", "file.xlsx", "/me/drive") == "/me/drive/root:/file.xlsx"
+    # Explicit drive id: drive_root="/drives/{id}"
+    assert build_resolution_url("id", "xyz", "/drives/drive1") == "/drives/drive1/items/xyz"
+    # Share URLs ignore drive_root entirely.
     url = "https://tenant.sharepoint.com/a"
     encoded = encode_share_url(url)
-    assert build_resolution_url("share", url, "me") == f"/shares/{encoded}/driveItem"
+    assert build_resolution_url("share", url, "/me/drive") == f"/shares/{encoded}/driveItem"
 
 def test_match_sheet_name():
     sheets = ["Sheet1", "data", "REPORT_2026"]

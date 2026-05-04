@@ -150,8 +150,9 @@ class GraphClient:
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
 
-    def _resolve_drive_id(self) -> str:
-        return self._default_drive_id if self._default_drive_id else "me"
+    def _drive_root(self) -> str:
+        """URL fragment for the drive scope, e.g. ``/me/drive`` or ``/drives/{id}``."""
+        return f"/drives/{self._default_drive_id}" if self._default_drive_id else "/me/drive"
 
     async def _request(self, method: str, url: str, **kw: Any) -> httpx.Response:
         if not url.startswith("http"):
@@ -160,7 +161,7 @@ class GraphClient:
         attempt = 0
         while True:
             token = await asyncio.to_thread(self._provider.get_token)
-            
+
             headers = kw.pop("headers", {})
             headers["Authorization"] = f"Bearer {token}"
             kw["headers"] = headers
@@ -168,7 +169,7 @@ class GraphClient:
             async with self._semaphore:
                 logger.debug("Graph request %s %s", method, url)
                 response = await self._client.request(method, url, **kw)
-                
+
             status = response.status_code
             logger.debug("Graph response %s %s -> %s", method, url, status)
 
@@ -179,6 +180,7 @@ class GraphClient:
                 if attempt >= _DEFAULT_MAX_RETRIES:
                     logger.error("Graph request failed after %s attempts", attempt)
                     response.raise_for_status()
+                    raise AssertionError("unreachable")
 
                 backoff = _compute_backoff(attempt, response.headers.get("Retry-After"))
                 logger.info("Retrying %s %s in %.1fs (attempt %s)", method, url, backoff, attempt + 1)
@@ -188,6 +190,7 @@ class GraphClient:
 
             logger.error("Graph request failed %s: %s", status, response.text)
             response.raise_for_status()
+            raise AssertionError("unreachable")
 
     async def _get_download_url(
         self,
@@ -200,7 +203,7 @@ class GraphClient:
         value = item_path if kind == "path" else share_url if kind == "share" else item_id
         assert value is not None
 
-        url = build_resolution_url(kind, value, self._resolve_drive_id())
+        url = build_resolution_url(kind, value, self._drive_root())
         resp = await self._request("GET", url)
         data = resp.json()
         download_url = data.get("@microsoft.graph.downloadUrl")
@@ -287,36 +290,40 @@ class GraphClient:
         from gex_msgraph._files import match_sheet_name
 
         async def _process_one(path: str) -> pd.DataFrame | None:
+            # Step 1: download + open. Failures here are governed by `on_error`.
             try:
                 data = await self.download(item_path=path)
                 buf = io.BytesIO(data)
-                
                 xls = pd.ExcelFile(buf)
                 matched = match_sheet_name(xls.sheet_names, sheet, sheet_match)
-                
-                if matched is None:
-                    if on_missing_sheet == "raise":
-                        raise ValueError(f"Sheet '{sheet}' not found in {path}")
-                    elif on_missing_sheet == "warn":
-                        logger.warning("Sheet '%s' not found in %s", sheet, path)
-                        return None
-                    elif on_missing_sheet == "skip":
-                        return None
-
-                df = pd.read_excel(xls, sheet_name=matched, **read_excel_kwargs)
-                if add_source_column:
-                    df["_source"] = path
-                return df
-                
             except Exception as e:
                 if on_error == "raise":
                     raise
-                elif on_error == "warn":
+                if on_error == "warn":
                     logger.warning("Failed to read %s: %s", path, e)
-                    return None
-                elif on_error == "skip":
-                    return None
                 return None
+
+            # Step 2: missing-sheet decision is independent of `on_error`.
+            if matched is None:
+                if on_missing_sheet == "raise":
+                    raise ValueError(f"Sheet '{sheet}' not found in {path}")
+                if on_missing_sheet == "warn":
+                    logger.warning("Sheet '%s' not found in %s", sheet, path)
+                return None
+
+            # Step 3: parse the matched sheet. Parse failures fall under `on_error`.
+            try:
+                df = pd.read_excel(xls, sheet_name=matched, **read_excel_kwargs)
+            except Exception as e:
+                if on_error == "raise":
+                    raise
+                if on_error == "warn":
+                    logger.warning("Failed to read %s: %s", path, e)
+                return None
+
+            if add_source_column:
+                df["_source"] = path
+            return df
 
         sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
         
@@ -344,31 +351,31 @@ class GraphClient:
         """List files (not folders) under a folder. Recursive by default."""
         import fnmatch
         from gex_msgraph._files import parse_drive_item
-        
-        drive_id = self._resolve_drive_id()
+
+        drive_root = self._drive_root()
         clean_path = folder_path.lstrip("/")
-        
+
         if clean_path:
-            base_url = f"/drives/{drive_id}/root:/{clean_path}:/children"
+            base_url = f"{drive_root}/root:/{clean_path}:/children"
         else:
-            base_url = f"/drives/{drive_id}/root/children"
-            
+            base_url = f"{drive_root}/root/children"
+
         results: list[FileItem] = []
-        
+
         async def _explore(url: str, current_path: str) -> None:
             subfolders: list[tuple[str, str]] = []
-            
+
             async for item in self._iter_paginated(url):
                 file_item = parse_drive_item(item, parent_path=current_path)
-                
+
                 if file_item.is_folder:
                     if recursive:
-                        folder_url = f"/drives/{drive_id}/items/{file_item.id}/children"
+                        folder_url = f"{drive_root}/items/{file_item.id}/children"
                         subfolders.append((folder_url, file_item.path))
                 else:
                     if pattern is None or fnmatch.fnmatch(file_item.name, pattern):
                         results.append(file_item)
-                        
+
             tasks = [_explore(sub_url, sub_path) for sub_url, sub_path in subfolders]
             if tasks:
                 await asyncio.gather(*tasks)
@@ -379,19 +386,19 @@ class GraphClient:
     async def list_files(self, folder_path: str = "") -> list[FileItem]:
         """List immediate children (files and folders) of one folder. Non-recursive."""
         from gex_msgraph._files import parse_drive_item
-        
-        drive_id = self._resolve_drive_id()
+
+        drive_root = self._drive_root()
         clean_path = folder_path.lstrip("/")
-        
+
         if clean_path:
-            url = f"/drives/{drive_id}/root:/{clean_path}:/children"
+            url = f"{drive_root}/root:/{clean_path}:/children"
         else:
-            url = f"/drives/{drive_id}/root/children"
-            
+            url = f"{drive_root}/root/children"
+
         results: list[FileItem] = []
         async for item in self._iter_paginated(url):
             results.append(parse_drive_item(item, parent_path=clean_path))
-            
+
         return results
 
     async def get_metadata(
@@ -406,8 +413,8 @@ class GraphClient:
         kind = validate_identifier(item_path, share_url, item_id)
         value = item_path if kind == "path" else share_url if kind == "share" else item_id
         assert value is not None
-        
-        url = build_resolution_url(kind, value, self._resolve_drive_id())
+
+        url = build_resolution_url(kind, value, self._drive_root())
         resp = await self._request("GET", url)
         return parse_drive_item(resp.json())
 
@@ -422,8 +429,8 @@ class GraphClient:
         kind = validate_identifier(item_path, share_url, item_id)
         value = item_path if kind == "path" else share_url if kind == "share" else item_id
         assert value is not None
-        
-        url = build_resolution_url(kind, value, self._resolve_drive_id())
+
+        url = build_resolution_url(kind, value, self._drive_root())
         await self._request("DELETE", url)
 
     async def move_file(
@@ -435,25 +442,25 @@ class GraphClient:
         """Move or rename a file using paths."""
         from gex_msgraph._files import parse_drive_item
         import urllib.parse
-        
-        drive_id = self._resolve_drive_id()
+
+        drive_root = self._drive_root()
         source_clean = source_path.lstrip("/")
-        
+
         encoded_source = urllib.parse.quote(source_clean)
-        url = f"/drives/{drive_id}/root:/{encoded_source}"
-        
+        url = f"{drive_root}/root:/{encoded_source}"
+
         payload: dict[str, Any] = {}
         if dest_folder_path is not None:
             dest_clean = dest_folder_path.lstrip("/")
             payload["parentReference"] = {
-                "path": f"/drive/root:/{dest_clean}" if dest_clean else "/drive/root"
+                "path": f"{drive_root}/root:/{dest_clean}" if dest_clean else f"{drive_root}/root"
             }
         if new_name is not None:
             payload["name"] = new_name
-            
+
         if not payload:
             raise ValueError("Must provide dest_folder_path or new_name")
-            
+
         resp = await self._request("PATCH", url, json=payload)
         return parse_drive_item(resp.json())
 
@@ -461,17 +468,17 @@ class GraphClient:
         """Create a new folder."""
         from gex_msgraph._files import parse_drive_item
         import urllib.parse
-        
-        drive_id = self._resolve_drive_id()
+
+        drive_root = self._drive_root()
         clean_path = folder_path.lstrip("/")
-        
+
         if "/" in clean_path:
             parent, name = clean_path.rsplit("/", 1)
             encoded_parent = urllib.parse.quote(parent)
-            url = f"/drives/{drive_id}/root:/{encoded_parent}:/children"
+            url = f"{drive_root}/root:/{encoded_parent}:/children"
         else:
             name = clean_path
-            url = f"/drives/{drive_id}/root/children"
+            url = f"{drive_root}/root/children"
             
         payload = {
             "name": name,
@@ -493,21 +500,23 @@ class GraphClient:
         kind = validate_identifier(item_path, share_url, item_id)
         value = item_path if kind == "path" else share_url if kind == "share" else item_id
         assert value is not None
-        
-        url = build_resolution_url(kind, value, self._resolve_drive_id()) + ":/workbook/worksheets"
-        resp = await self._request("GET", url)
+
+        base = build_resolution_url(kind, value, self._drive_root())
+        # Path-addressed items use the ":/workbook/..." colon syntax;
+        # id- and share-addressed items concatenate directly.
+        suffix = ":/workbook/worksheets" if kind == "path" else "/workbook/worksheets"
+        resp = await self._request("GET", base + suffix)
         return [str(sheet["name"]) for sheet in resp.json().get("value", [])]
 
     async def get_folder_tree(self, folder_path: str = "") -> "TreeNode":
         """Return a recursive tree representation of a folder."""
         from gex_msgraph._files import TreeNode
-        
-        root_item = None
-        if folder_path:
-            root_item = await self.get_metadata(item_path=folder_path)
-            
+
+        # Drive root has no addressable metadata in the path-resolution form,
+        # so leave `item` as None when listing from the root.
+        root_item = await self.get_metadata(item_path=folder_path) if folder_path else None
         root_node = TreeNode(item=root_item, children=[])
-        
+
         async def _build_tree(path: str, node: TreeNode) -> None:
             children_items = await self.list_files(path)
             for child in children_items:
@@ -515,7 +524,7 @@ class GraphClient:
                 node.children.append(child_node)
                 if child.is_folder:
                     await _build_tree(child.path, child_node)
-                    
+
         await _build_tree(folder_path, root_node)
         return root_node
 
@@ -528,11 +537,11 @@ class GraphClient:
         if not local_p.is_file():
             raise FileNotFoundError(f"File not found: {local_path}")
             
-        drive_id = self._resolve_drive_id()
+        drive_root = self._drive_root()
         clean_remote = remote_path.lstrip("/")
         encoded_path = urllib.parse.quote(clean_remote)
-        
-        url = f"/drives/{drive_id}/root:/{encoded_path}:/content"
+
+        url = f"{drive_root}/root:/{encoded_path}:/content"
         
         with open(local_p, "rb") as f:
             data = f.read()
@@ -569,7 +578,7 @@ class GraphClient:
         if cc:
             payload["message"]["ccRecipients"] = _make_recipients(cc)
             
-        await self._request("POST", "/users/me/sendMail", json=payload)
+        await self._request("POST", "/me/sendMail", json=payload)
 
     async def send_teams_message(
         self,
