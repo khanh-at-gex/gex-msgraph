@@ -276,6 +276,18 @@ class GraphClient:
         **read_excel_kwargs: Any,
     ) -> pd.DataFrame:
         """Read many Excel files concurrently and concat into one DataFrame."""
+        
+    async def read_csv_many(
+        self,
+        paths: list[str],
+        *,
+        on_error: Literal["raise", "skip", "warn"] = "raise",
+        add_source_column: bool = True,
+        max_concurrent: int | None = None,
+        return_status: bool = False,
+        **read_csv_kwargs: Any,
+    ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+        """Read many CSV files concurrently and concat into one DataFrame."""
 
     # ─────────────────────────────────────────────────────────────
     # Discovery
@@ -861,7 +873,6 @@ Must pass before merging. Required by `AGENTS.md` rules.
 - Email attachments — v0.2 candidate
 - HTML mail body — v0.2 candidate
 - `download_to_file()` — caller writes bytes if needed
-- `read_csv_many()` — caller can `gather()` `read_csv` calls
 - `find_site()` / `list_drives()` helpers — use Graph Explorer in browser to find IDs once
 - Per-call `drive_id` / `site_id` overrides — set defaults in `.env`
 - File deletion / move

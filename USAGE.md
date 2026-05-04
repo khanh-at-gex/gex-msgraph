@@ -79,7 +79,8 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Read Excel by path:** `await client.read_excel(item_path="Folder/File.xlsx")`
 - **Read Excel by share link:** `await client.read_excel(share_url="https://tenant.sharepoint.com/.../File.xlsx")`
 - **Read CSV:** `await client.read_csv(item_path="data.csv")`
-- **Bulk read:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
+- **Bulk read Excel:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
+- **Bulk read CSV (with status logging):** `df, status_df = await client.read_csv_many(["A.csv", "B.csv"], on_error="skip", return_status=True)`
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
 - **Download raw bytes:** `await client.download(item_path="image.png")`

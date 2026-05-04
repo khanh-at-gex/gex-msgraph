@@ -30,16 +30,17 @@ def _load_account_env(name: str) -> dict[str, str]:
     """Read MS_<NAME>_* env vars, return as dict."""
     prefix = f"MS_{name.upper()}_"
 
-    res: dict[str, str] = {}
-    for req in ["CLIENT_ID", "CLIENT_SECRET", "TENANT_ID", "USERNAME", "PASSWORD"]:
-        val = os.environ.get(prefix + req)
-        if val:
-            res[req.lower()] = val
+    keys = ["CLIENT_ID", "CLIENT_SECRET", "TENANT_ID", "USERNAME", "PASSWORD"]
+    res = {k.lower(): v for k in keys if (v := os.environ.get(prefix + k))}
 
-    res["default_site_id"] = os.environ.get(prefix + "DEFAULT_SITE_ID", "")
-    res["default_drive_id"] = os.environ.get(prefix + "DEFAULT_DRIVE_ID", "")
-    res["max_concurrent"] = os.environ.get(prefix + "MAX_CONCURRENT", str(_DEFAULT_MAX_CONCURRENT))
-    res["request_timeout"] = os.environ.get(prefix + "REQUEST_TIMEOUT", str(_DEFAULT_TIMEOUT))
+    defaults = {
+        "DEFAULT_SITE_ID": "",
+        "DEFAULT_DRIVE_ID": "",
+        "MAX_CONCURRENT": str(_DEFAULT_MAX_CONCURRENT),
+        "REQUEST_TIMEOUT": str(_DEFAULT_TIMEOUT),
+    }
+    for k, default_val in defaults.items():
+        res[k.lower()] = os.environ.get(prefix + k, default_val)
 
     return res
 
@@ -109,34 +110,38 @@ class GraphClient:
         self.account = account or "custom"
         cfg = _load_account_env(account) if account else {}
 
-        resolved_client_id = client_id or cfg.get("client_id")
-        resolved_client_secret = client_secret or cfg.get("client_secret")
-        resolved_tenant_id = tenant_id or cfg.get("tenant_id")
-        resolved_username = username or cfg.get("username")
-        resolved_password = password or cfg.get("password")
+        creds: dict[str, str] = {}
+        for key, val in [
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("tenant_id", tenant_id),
+            ("username", username),
+            ("password", password),
+        ]:
+            resolved = val or cfg.get(key)
+            if not resolved:
+                raise KeyError(
+                    f"MS_{self.account.upper()}_{key.upper()}" if account else key
+                )
+            creds[key] = resolved
 
-        if not resolved_client_id:
-            raise KeyError(f"MS_{self.account.upper()}_CLIENT_ID" if account else "client_id")
-        if not resolved_client_secret:
-            raise KeyError(f"MS_{self.account.upper()}_CLIENT_SECRET" if account else "client_secret")
-        if not resolved_tenant_id:
-            raise KeyError(f"MS_{self.account.upper()}_TENANT_ID" if account else "tenant_id")
-        if not resolved_username:
-            raise KeyError(f"MS_{self.account.upper()}_USERNAME" if account else "username")
-        if not resolved_password:
-            raise KeyError(f"MS_{self.account.upper()}_PASSWORD" if account else "password")
-
-        self._provider = _TokenProvider(
-            client_id=resolved_client_id,
-            client_secret=resolved_client_secret,
-            tenant_id=resolved_tenant_id,
-            username=resolved_username,
-            password=resolved_password,
+        self._provider = _TokenProvider(**creds)
+        self._default_drive_id = (
+            default_drive_id
+            if default_drive_id is not None
+            else cfg.get("default_drive_id", "")
         )
-        self._default_drive_id = default_drive_id if default_drive_id is not None else cfg.get("default_drive_id", "")
 
-        timeout = request_timeout if request_timeout is not None else float(cfg.get("request_timeout", _DEFAULT_TIMEOUT))
-        concurrent = max_concurrent if max_concurrent is not None else int(cfg.get("max_concurrent", _DEFAULT_MAX_CONCURRENT))
+        timeout = (
+            request_timeout
+            if request_timeout is not None
+            else float(cfg.get("request_timeout", _DEFAULT_TIMEOUT))
+        )
+        concurrent = (
+            max_concurrent
+            if max_concurrent is not None
+            else int(cfg.get("max_concurrent", _DEFAULT_MAX_CONCURRENT))
+        )
 
         self._client = httpx.AsyncClient(timeout=timeout)
         self._semaphore = asyncio.Semaphore(concurrent)
@@ -153,7 +158,27 @@ class GraphClient:
 
     def _drive_root(self) -> str:
         """URL fragment for the drive scope, e.g. ``/me/drive`` or ``/drives/{id}``."""
-        return f"/drives/{self._default_drive_id}" if self._default_drive_id else "/me/drive"
+        return (
+            f"/drives/{self._default_drive_id}"
+            if self._default_drive_id
+            else "/me/drive"
+        )
+
+    def _resolve_item_url(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> tuple[Literal["path", "share", "id"], str]:
+        kind = validate_identifier(item_path, share_url, item_id)
+        value = (
+            item_path if kind == "path" else share_url if kind == "share" else item_id
+        )
+        assert value is not None
+
+        url = build_resolution_url(kind, value, self._drive_root())
+        return kind, url
 
     async def _request(self, method: str, url: str, **kw: Any) -> httpx.Response:
         if not url.startswith("http"):
@@ -184,7 +209,13 @@ class GraphClient:
                     raise AssertionError("unreachable")
 
                 backoff = _compute_backoff(attempt, response.headers.get("Retry-After"))
-                logger.info("Retrying %s %s in %.1fs (attempt %s)", method, url, backoff, attempt + 1)
+                logger.info(
+                    "Retrying %s %s in %.1fs (attempt %s)",
+                    method,
+                    url,
+                    backoff,
+                    attempt + 1,
+                )
                 await asyncio.sleep(backoff)
                 attempt += 1
                 continue
@@ -200,16 +231,14 @@ class GraphClient:
         share_url: str | None = None,
         item_id: str | None = None,
     ) -> str:
-        kind = validate_identifier(item_path, share_url, item_id)
-        value = item_path if kind == "path" else share_url if kind == "share" else item_id
-        assert value is not None
-
-        url = build_resolution_url(kind, value, self._drive_root())
+        _, url = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
         resp = await self._request("GET", url)
         data = resp.json()
         download_url = data.get("@microsoft.graph.downloadUrl")
         if not download_url:
-            raise RuntimeError(f"Could not resolve download URL for item: {value}")
+            raise RuntimeError(f"Could not resolve download URL for item: {item_path or share_url or item_id}")
         return str(download_url)
 
     async def _stream_to_bytes(self, url: str) -> bytes:
@@ -240,7 +269,9 @@ class GraphClient:
         import io
         import pandas as pd
 
-        data = await self.download(item_path=item_path, share_url=share_url, item_id=item_id)
+        data = await self.download(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
         buf = io.BytesIO(data)
         return pd.read_excel(buf, sheet_name=sheet, **read_excel_kwargs)
 
@@ -256,7 +287,9 @@ class GraphClient:
         import io
         import pandas as pd
 
-        data = await self.download(item_path=item_path, share_url=share_url, item_id=item_id)
+        data = await self.download(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
         buf = io.BytesIO(data)
         return pd.read_csv(buf, **read_csv_kwargs)
 
@@ -283,15 +316,18 @@ class GraphClient:
         on_error: Literal["raise", "skip", "warn"] = "raise",
         add_source_column: bool = True,
         max_concurrent: int | None = None,
+        return_status: bool = False,
         **read_excel_kwargs: Any,
-    ) -> "pd.DataFrame":
-        """Read many Excel files concurrently and concat into one DataFrame."""
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
+        """Read many Excel files concurrently and concat into one DataFrame.
+
+        If `return_status=True`, returns `(combined_df, status_df)`.
+        """
         import io
         import pandas as pd
         from gex_msgraph._files import match_sheet_name
 
-        async def _process_one(path: str) -> pd.DataFrame | None:
-            # Step 1: download + open. Failures here are governed by `on_error`.
+        async def _process_one(path: str) -> tuple[pd.DataFrame | None, str, str]:
             try:
                 data = await self.download(item_path=path)
                 buf = io.BytesIO(data)
@@ -302,17 +338,15 @@ class GraphClient:
                     raise
                 if on_error == "warn":
                     logger.warning("Failed to read %s: %s", path, e)
-                return None
+                return None, "error", str(e)
 
-            # Step 2: missing-sheet decision is independent of `on_error`.
             if matched is None:
                 if on_missing_sheet == "raise":
                     raise ValueError(f"Sheet '{sheet}' not found in {path}")
                 if on_missing_sheet == "warn":
                     logger.warning("Sheet '%s' not found in %s", sheet, path)
-                return None
+                return None, "missing_sheet", f"Sheet '{sheet}' not found"
 
-            # Step 3: parse the matched sheet. Parse failures fall under `on_error`.
             try:
                 df = pd.read_excel(xls, sheet_name=matched, **read_excel_kwargs)
             except Exception as e:
@@ -320,27 +354,110 @@ class GraphClient:
                     raise
                 if on_error == "warn":
                     logger.warning("Failed to read %s: %s", path, e)
-                return None
+                return None, "error", str(e)
 
             if add_source_column:
                 df["_source"] = path
-            return df
+            return df, "success", ""
 
         sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
-        
-        async def _bounded_process(path: str) -> pd.DataFrame | None:
+
+        async def _bounded_process(
+            path: str,
+        ) -> tuple[str, pd.DataFrame | None, str, str]:
             if sem:
                 async with sem:
-                    return await _process_one(path)
-            return await _process_one(path)
+                    df, status, msg = await _process_one(path)
+            else:
+                df, status, msg = await _process_one(path)
+            return path, df, status, msg
 
         tasks = [_bounded_process(p) for p in paths]
         results = await asyncio.gather(*tasks)
-        
-        valid_dfs = [df for df in results if df is not None]
-        if not valid_dfs:
-            return pd.DataFrame()
-        return pd.concat(valid_dfs, ignore_index=True, sort=False)
+
+        valid_dfs = []
+        status_records = []
+        for path, df, status, msg in results:
+            if df is not None:
+                valid_dfs.append(df)
+            status_records.append({"path": path, "status": status, "error": msg})
+
+        combined_df = (
+            pd.concat(valid_dfs, ignore_index=True, sort=False)
+            if valid_dfs
+            else pd.DataFrame()
+        )
+
+        if return_status:
+            status_df = pd.DataFrame(status_records)
+            return combined_df, status_df
+        return combined_df
+
+    async def read_csv_many(
+        self,
+        paths: list[str],
+        *,
+        on_error: Literal["raise", "skip", "warn"] = "raise",
+        add_source_column: bool = True,
+        max_concurrent: int | None = None,
+        return_status: bool = False,
+        **read_csv_kwargs: Any,
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
+        """Read many CSV files concurrently and concat into one DataFrame.
+
+        If `return_status=True`, returns `(combined_df, status_df)`.
+        """
+        import io
+        import pandas as pd
+
+        async def _process_one(path: str) -> tuple[pd.DataFrame | None, str, str]:
+            try:
+                data = await self.download(item_path=path)
+                buf = io.BytesIO(data)
+                df = pd.read_csv(buf, **read_csv_kwargs)
+            except Exception as e:
+                if on_error == "raise":
+                    raise
+                if on_error == "warn":
+                    logger.warning("Failed to read %s: %s", path, e)
+                return None, "error", str(e)
+
+            if add_source_column:
+                df["_source"] = path
+            return df, "success", ""
+
+        sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
+
+        async def _bounded_process(
+            path: str,
+        ) -> tuple[str, pd.DataFrame | None, str, str]:
+            if sem:
+                async with sem:
+                    df, status, msg = await _process_one(path)
+            else:
+                df, status, msg = await _process_one(path)
+            return path, df, status, msg
+
+        tasks = [_bounded_process(p) for p in paths]
+        results = await asyncio.gather(*tasks)
+
+        valid_dfs = []
+        status_records = []
+        for path, df, status, msg in results:
+            if df is not None:
+                valid_dfs.append(df)
+            status_records.append({"path": path, "status": status, "error": msg})
+
+        combined_df = (
+            pd.concat(valid_dfs, ignore_index=True, sort=False)
+            if valid_dfs
+            else pd.DataFrame()
+        )
+
+        if return_status:
+            status_df = pd.DataFrame(status_records)
+            return combined_df, status_df
+        return combined_df
 
     async def walk(
         self,
@@ -411,11 +528,10 @@ class GraphClient:
     ) -> FileItem:
         """Fetch metadata for a single item without downloading its content."""
         from gex_msgraph._files import parse_drive_item
-        kind = validate_identifier(item_path, share_url, item_id)
-        value = item_path if kind == "path" else share_url if kind == "share" else item_id
-        assert value is not None
 
-        url = build_resolution_url(kind, value, self._drive_root())
+        _, url = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
         resp = await self._request("GET", url)
         return parse_drive_item(resp.json())
 
@@ -427,11 +543,9 @@ class GraphClient:
         item_id: str | None = None,
     ) -> None:
         """Delete an item."""
-        kind = validate_identifier(item_path, share_url, item_id)
-        value = item_path if kind == "path" else share_url if kind == "share" else item_id
-        assert value is not None
-
-        url = build_resolution_url(kind, value, self._drive_root())
+        _, url = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
         await self._request("DELETE", url)
 
     async def move_file(
@@ -454,7 +568,11 @@ class GraphClient:
         if dest_folder_path is not None:
             dest_clean = dest_folder_path.lstrip("/")
             payload["parentReference"] = {
-                "path": f"{drive_root}/root:/{dest_clean}" if dest_clean else f"{drive_root}/root"
+                "path": (
+                    f"{drive_root}/root:/{dest_clean}"
+                    if dest_clean
+                    else f"{drive_root}/root"
+                )
             }
         if new_name is not None:
             payload["name"] = new_name
@@ -480,13 +598,13 @@ class GraphClient:
         else:
             name = clean_path
             url = f"{drive_root}/root/children"
-            
+
         payload = {
             "name": name,
             "folder": {},
-            "@microsoft.graph.conflictBehavior": "rename"
+            "@microsoft.graph.conflictBehavior": "rename",
         }
-        
+
         resp = await self._request("POST", url, json=payload)
         return parse_drive_item(resp.json())
 
@@ -498,11 +616,9 @@ class GraphClient:
         item_id: str | None = None,
     ) -> list[str]:
         """List all worksheet names in an Excel file."""
-        kind = validate_identifier(item_path, share_url, item_id)
-        value = item_path if kind == "path" else share_url if kind == "share" else item_id
-        assert value is not None
-
-        base = build_resolution_url(kind, value, self._drive_root())
+        kind, base = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
         # Path-addressed items use the ":/workbook/..." colon syntax;
         # id- and share-addressed items concatenate directly.
         suffix = ":/workbook/worksheets" if kind == "path" else "/workbook/worksheets"
@@ -515,7 +631,9 @@ class GraphClient:
 
         # Drive root has no addressable metadata in the path-resolution form,
         # so leave `item` as None when listing from the root.
-        root_item = await self.get_metadata(item_path=folder_path) if folder_path else None
+        root_item = (
+            await self.get_metadata(item_path=folder_path) if folder_path else None
+        )
         root_node = TreeNode(item=root_item, children=[])
 
         async def _build_tree(path: str, node: TreeNode) -> None:
@@ -529,25 +647,32 @@ class GraphClient:
         await _build_tree(folder_path, root_node)
         return root_node
 
-    async def upload(self, local_path: str | os.PathLike[str], remote_path: str) -> dict[str, Any]:
+    async def upload(
+        self, local_path: str | os.PathLike[str], remote_path: str
+    ) -> dict[str, Any]:
         """Upload a local file to remote_path. Returns the Graph driveItem dict."""
         import urllib.parse
         from pathlib import Path
-        
+
         local_p = Path(local_path)
         if not local_p.is_file():
             raise FileNotFoundError(f"File not found: {local_path}")
-            
+
         drive_root = self._drive_root()
         clean_remote = remote_path.lstrip("/")
         encoded_path = urllib.parse.quote(clean_remote)
 
         url = f"{drive_root}/root:/{encoded_path}:/content"
-        
+
         with open(local_p, "rb") as f:
             data = f.read()
-            
-        resp = await self._request("PUT", url, content=data, headers={"Content-Type": "application/octet-stream"})
+
+        resp = await self._request(
+            "PUT",
+            url,
+            content=data,
+            headers={"Content-Type": "application/octet-stream"},
+        )
         return cast(dict[str, Any], resp.json())
 
     async def send_mail(
@@ -559,11 +684,12 @@ class GraphClient:
         cc: str | list[str] | None = None,
     ) -> None:
         """Send a plain-text email from the account's mailbox."""
+
         def _make_recipients(addrs: str | list[str]) -> list[dict[str, Any]]:
             if isinstance(addrs, str):
                 addrs = [addrs]
             return [{"emailAddress": {"address": a}} for a in addrs]
-            
+
         payload: dict[str, Any] = {
             "message": {
                 "subject": subject,
@@ -573,12 +699,12 @@ class GraphClient:
                 },
                 "toRecipients": _make_recipients(to),
             },
-            "saveToSentItems": "true"
+            "saveToSentItems": "true",
         }
-        
+
         if cc:
             payload["message"]["ccRecipients"] = _make_recipients(cc)
-            
+
         await self._request("POST", "/me/sendMail", json=payload)
 
     async def send_teams_message(
@@ -588,12 +714,7 @@ class GraphClient:
         text: str,
     ) -> None:
         """Post a plain-text message to a Teams channel."""
-        payload = {
-            "body": {
-                "contentType": "Text",
-                "content": text
-            }
-        }
+        payload = {"body": {"contentType": "Text", "content": text}}
         url = f"/teams/{team_id}/channels/{channel_id}/messages"
         await self._request("POST", url, json=payload)
 
