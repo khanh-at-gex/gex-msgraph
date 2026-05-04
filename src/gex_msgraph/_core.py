@@ -729,6 +729,27 @@ class GraphClient:
         resp = await self._request("GET", url)
         return cast(list[dict[str, Any]], resp.json().get("value", []))
 
+    async def list_chats(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List all chats (1-1, group, meeting) the account participates in, including members."""
+        url = f"/me/chats?$expand=members&$top={limit}"
+        resp = await self._request("GET", url)
+        return cast(list[dict[str, Any]], resp.json().get("value", []))
+
+    async def get_chat_messages(
+        self,
+        chat_id: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent messages from a Teams chat."""
+        url = f"/chats/{chat_id}/messages?$top={limit}"
+        resp = await self._request("GET", url)
+        return cast(list[dict[str, Any]], resp.json().get("value", []))
+
+    async def send_chat_message(self, chat_id: str, text: str) -> None:
+        """Post a plain-text message to a Teams chat."""
+        payload = {"body": {"contentType": "Text", "content": text}}
+        await self._request("POST", f"/chats/{chat_id}/messages", json=payload)
+
     def read_excel_sync(self, **kw: Any) -> "pd.DataFrame":
         return asyncio.run(self.read_excel(**kw))
 

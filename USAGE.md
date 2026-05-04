@@ -100,8 +100,11 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 
 ### Communications
 - **Send mail:** `await client.send_mail("test@test.com", "Subj", "Body")`
-- **Send Teams:** `await client.send_teams_message("team1", "chan1", "Hello")`
-- **Read Teams:** `msgs = await client.get_teams_messages("team1", "chan1", limit=10)`
+- **Send Teams channel:** `await client.send_teams_message("team1", "chan1", "Hello")`
+- **Read Teams channel:** `msgs = await client.get_teams_messages("team1", "chan1", limit=10)`
+- **List chats:** `chats = await client.list_chats(limit=20)`
+- **Get chat messages:** `msgs = await client.get_chat_messages("chat_id", limit=10)`
+- **Send chat message:** `await client.send_chat_message("chat_id", "Hello!")`
 
 ## 8. Multi-account
 Instantiate two clients, e.g. `client1 = GraphClient("das_u1")` and `client2 = GraphClient("das_u2")`.
@@ -134,167 +137,966 @@ Update the pin to `@v0.2.0` in `requirements.txt` or via `uv add "gex-msgraph @ 
 
 ## API Reference
 
-### Instantiation
+---
 
-#### `GraphClient(account=None, **kwargs)`
-Creates a new Graph API client.
+### `FileItem`
 
-**Params:**
-- `account` (`str | None`): The prefix for environment variables (e.g. `ACCOUNT` will read `MS_ACCOUNT_CLIENT_ID`). Defaults to `"custom"`.
-- `client_id`, `client_secret`, `tenant_id`, `username`, `password` (`str | None`): Explicit credentials, overriding environment variables.
-- `default_site_id`, `default_drive_id` (`str | None`): The SharePoint site or Drive ID to target by default.
-- `max_concurrent` (`int | None`): Maximum concurrent async requests.
-- `request_timeout` (`float | None`): Timeout in seconds.
+Immutable dataclass representing a file or folder in OneDrive / SharePoint.
 
-**Example:**
+**Fields**
+
+- **`name`** (`str`) — File or folder name, without path (e.g. `"Q1.xlsx"`).
+- **`path`** (`str`) — Path relative to the drive root (e.g. `"Reports/Q1.xlsx"`).
+- **`id`** (`str`) — Microsoft Graph item ID (opaque string).
+- **`size`** (`int`) — Size in bytes. `0` for folders.
+- **`modified`** (`datetime`) — Last modification time, timezone-aware UTC.
+- **`is_folder`** (`bool`) — `True` when the item is a folder.
+
+---
+
+### `TreeNode`
+
+Recursive tree node returned by [`get_folder_tree`](#graphclientget_folder_treefolderpath). Rendered with `print()`.
+
+**Fields**
+
+- **`item`** (`FileItem | None`) — Metadata for this node. `None` only for the drive root.
+- **`children`** (`list[TreeNode]`) — Direct child nodes (files and sub-folders).
+
+#### `TreeNode.print(indent=0)`
+
+Print the tree structure to stdout with `📁`/`📄` icons.
+
+**Parameters**
+
+- **`indent`** (`int`, default `0`) — Starting indentation level; each level adds two spaces.
+
+**Example**
+
 ```python
-async with GraphClient("my_app") as client:
-    pass  # initialized with MS_MY_APP_CLIENT_ID, etc.
+tree = await client.get_folder_tree("Reports")
+tree.print()
+# 📁 Reports (0 bytes)
+#   📄 Q1.xlsx (45231 bytes)
+#   📁 Archive (0 bytes)
+#     📄 2025.xlsx (12000 bytes)
 ```
 
 ---
 
-### File Operations (Download/Read)
+### `GraphClient`
 
-#### `download(*, item_path=None, share_url=None, item_id=None)` → `bytes`
-Return raw file bytes. Exactly one identifier must be provided.
+Async client for Microsoft Graph API. Manages authentication (MSAL ROPC flow), connection pooling, semaphore-based concurrency, and automatic retry on 429 / 5xx responses (up to 3 attempts, exponential backoff capped at 30 s).
+
+#### `GraphClient.__init__`
 
 ```python
-data = await client.download(item_path="documents/report.pdf")
-with open("local_report.pdf", "wb") as f:
+GraphClient(
+    account: str | None = None,
+    *,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    tenant_id: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    default_site_id: str | None = None,
+    default_drive_id: str | None = None,
+    max_concurrent: int | None = None,
+    request_timeout: float | None = None,
+)
+```
+
+**Parameters**
+
+- **`account`** (`str | None`, default `None`) — Env-var prefix. When set to e.g. `"das_u1"`, the following variables are read: `MS_DAS_U1_CLIENT_ID`, `MS_DAS_U1_CLIENT_SECRET`, `MS_DAS_U1_TENANT_ID`, `MS_DAS_U1_USERNAME`, `MS_DAS_U1_PASSWORD`. Keyword arguments below override any env var. When `None`, all five credentials must be passed explicitly; `account` is recorded as `"custom"`.
+- **`client_id`** (`str | None`, default `None`) — Azure app registration client ID. Overrides `MS_<ACCOUNT>_CLIENT_ID`.
+- **`client_secret`** (`str | None`, default `None`) — Azure app client secret. Overrides `MS_<ACCOUNT>_CLIENT_SECRET`.
+- **`tenant_id`** (`str | None`, default `None`) — Azure tenant (directory) ID. Overrides `MS_<ACCOUNT>_TENANT_ID`.
+- **`username`** (`str | None`, default `None`) — Service account UPN (e.g. `svc@company.com`). Overrides `MS_<ACCOUNT>_USERNAME`.
+- **`password`** (`str | None`, default `None`) — Service account password. Overrides `MS_<ACCOUNT>_PASSWORD`.
+- **`default_site_id`** (`str | None`, default `None`) — SharePoint site ID (informational; not currently used in URL routing).
+- **`default_drive_id`** (`str | None`, default `None`) — Drive ID. When set, all drive-scoped URLs use `/drives/{id}` instead of `/me/drive`. Readable from `MS_<ACCOUNT>_DEFAULT_DRIVE_ID`.
+- **`max_concurrent`** (`int | None`, default `10`) — Maximum simultaneous in-flight Graph requests per client instance. Readable from `MS_<ACCOUNT>_MAX_CONCURRENT`.
+- **`request_timeout`** (`float | None`, default `30.0`) — Per-request HTTP timeout in seconds. Readable from `MS_<ACCOUNT>_REQUEST_TIMEOUT`.
+
+**Raises**
+
+- **`KeyError`** — If any required credential (`client_id`, `client_secret`, `tenant_id`, `username`, `password`) is neither provided explicitly nor found in the environment.
+
+**Notes**
+
+Use as an async context manager to ensure the underlying HTTP client is closed properly. For scripts, call `close()` manually or use the `_sync` wrappers.
+
+**Example**
+
+```python
+# From env vars
+async with GraphClient("das_u1") as client:
+    df = await client.read_excel(item_path="Reports/Q1.xlsx")
+
+# Explicit credentials
+client = GraphClient(
+    client_id="...",
+    client_secret="...",
+    tenant_id="...",
+    username="svc@company.com",
+    password="...",
+    default_drive_id="b!abc123",
+    max_concurrent=5,
+)
+```
+
+---
+
+#### `GraphClient.close()`
+
+Close the underlying HTTP client. Safe to call multiple times. Called automatically when the client is used as an async context manager.
+
+---
+
+### File Operations
+
+---
+
+#### `GraphClient.download`
+
+```python
+async def download(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+) -> bytes
+```
+
+Download a file and return its raw content as bytes. Exactly one of the three identifier parameters must be provided.
+
+**Parameters**
+
+- **`item_path`** (`str | None`, default `None`) — Path relative to the drive root, e.g. `"Documents/report.pdf"`.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link (full `https://…` URL from "Copy link").
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+
+**Returns**
+
+`bytes` — Raw file content.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`RuntimeError`** — If the Graph API response does not contain a `@microsoft.graph.downloadUrl`.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors (e.g. 403 Forbidden, 404 Not Found).
+
+**Example**
+
+```python
+data = await client.download(item_path="images/logo.png")
+with open("logo.png", "wb") as f:
     f.write(data)
 ```
 
-#### `read_excel(*, item_path=None, share_url=None, item_id=None, sheet=0, **kwargs)` → `pd.DataFrame`
-Read an Excel file directly into a pandas DataFrame.
+---
 
-- `sheet` (`str | int`): Sheet name or positional index.
-- `**kwargs`: Passed to `pandas.read_excel`.
+#### `GraphClient.read_excel`
 
 ```python
-df = await client.read_excel(share_url="https://tenant.sharepoint.com/:x:/r/...", sheet="Data")
+async def read_excel(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+    sheet: str | int = 0,
+    **kwargs,
+) -> pd.DataFrame
 ```
 
-#### `read_csv(*, item_path=None, share_url=None, item_id=None, **kwargs)` → `pd.DataFrame`
-Read a CSV file directly into a pandas DataFrame. `**kwargs` passed to `pandas.read_csv`.
+Download an Excel file and parse one sheet into a pandas DataFrame. Exactly one identifier must be provided.
+
+**Parameters**
+
+- **`item_path`** (`str | None`, default `None`) — Path relative to the drive root.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link.
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+- **`sheet`** (`str | int`, default `0`) — Sheet to read. An integer is a zero-based positional index; a string is the exact sheet name.
+- **`**kwargs`** — Forwarded verbatim to `pandas.read_excel` (e.g. `header`, `usecols`, `dtype`, `skiprows`).
+
+**Returns**
+
+`pd.DataFrame` — Contents of the requested sheet.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`RuntimeError`** — If the Graph API response does not contain a download URL.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
 
 ```python
-df = await client.read_csv(item_path="data/users.csv", sep=";")
-```
+# By path, second sheet (positional)
+df = await client.read_excel(item_path="Finance/budget.xlsx", sheet=1)
 
-#### `read_excel_many(paths, *, sheet=0, sheet_match="exact", on_missing_sheet="raise", on_error="raise", add_source_column=True, max_concurrent=None, return_status=False, **kwargs)`
-Read many Excel files concurrently and concatenate into one DataFrame.
-
-- `paths` (`list[str]`): List of paths to read.
-- `sheet_match` (`Literal["exact", "ci", "glob"]`): How to match sheet name.
-- `on_missing_sheet` (`Literal["raise", "skip", "warn"]`): Behavior when sheet not found.
-- `on_error` (`Literal["raise", "skip", "warn"]`): Behavior when file fails.
-- `add_source_column` (`bool`): Append `_source` column with originating path.
-- `return_status` (`bool`): If true, returns `(combined_df, status_df)`.
-
-```python
-df = await client.read_excel_many(["jan.xlsx", "feb.xlsx"], sheet="Sales", on_error="skip")
-```
-
-#### `list_excel_sheets(*, item_path=None, share_url=None, item_id=None)` → `list[str]`
-List all worksheet names in an Excel file.
-
-```python
-sheets = await client.list_excel_sheets(item_path="finance.xlsx")
-# ['Summary', 'Q1', 'Q2', ...]
+# By share link, named sheet, subset of columns
+df = await client.read_excel(
+    share_url="https://tenant.sharepoint.com/:x:/r/...",
+    sheet="Q1 Data",
+    usecols="A:F",
+    dtype={"Amount": float},
+)
 ```
 
 ---
 
-### File/Folder Management
-
-#### `walk(folder_path="", *, pattern=None, recursive=True)` → `list[FileItem]`
-List files under a folder. Folders are traversed but not returned.
+#### `GraphClient.read_csv`
 
 ```python
-files = await client.walk("archive", pattern="*.csv")
+async def read_csv(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+    **kwargs,
+) -> pd.DataFrame
 ```
 
-#### `list_files(folder_path="")` → `list[FileItem]`
-List immediate children (files and folders) of a single folder. Non-recursive.
+Download a CSV file and parse it into a pandas DataFrame. Exactly one identifier must be provided.
+
+**Parameters**
+
+- **`item_path`** (`str | None`, default `None`) — Path relative to the drive root.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link.
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+- **`**kwargs`** — Forwarded verbatim to `pandas.read_csv` (e.g. `sep`, `encoding`, `dtype`, `parse_dates`).
+
+**Returns**
+
+`pd.DataFrame` — Parsed CSV content.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`RuntimeError`** — If the Graph API response does not contain a download URL.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
 
 ```python
-items = await client.list_files("projects")
+df = await client.read_csv(item_path="data/users.csv", sep=";", encoding="utf-8-sig")
 ```
 
-#### `get_folder_tree(folder_path="")` → `TreeNode`
-Returns a recursive tree representation of a folder and all its contents.
+---
+
+#### `GraphClient.read_excel_many`
 
 ```python
-tree = await client.get_folder_tree()
+async def read_excel_many(
+    paths: list[str],
+    *,
+    sheet: str | int = 0,
+    sheet_match: Literal["exact", "ci", "glob"] = "exact",
+    on_missing_sheet: Literal["raise", "skip", "warn"] = "raise",
+    on_error: Literal["raise", "skip", "warn"] = "raise",
+    add_source_column: bool = True,
+    max_concurrent: int | None = None,
+    return_status: bool = False,
+    **kwargs,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]
+```
+
+Read multiple Excel files concurrently and concatenate them into one DataFrame.
+
+**Parameters**
+
+- **`paths`** (`list[str]`) — Item paths relative to the drive root to read.
+- **`sheet`** (`str | int`, default `0`) — Sheet selector applied to every file. An integer is a zero-based positional index; a string is matched using `sheet_match`.
+- **`sheet_match`** (`Literal["exact", "ci", "glob"]`, default `"exact"`) — Matching strategy for a string `sheet`:
+  - `"exact"` — case-sensitive equality.
+  - `"ci"` — case-insensitive equality.
+  - `"glob"` — `fnmatch` wildcard pattern (e.g. `"Sales*"`).
+- **`on_missing_sheet`** (`Literal["raise", "skip", "warn"]`, default `"raise"`) — Behaviour when the requested sheet is absent from a workbook:
+  - `"raise"` — raises `ValueError` immediately.
+  - `"skip"` — silently omits the file from the result.
+  - `"warn"` — logs a warning and omits the file.
+- **`on_error`** (`Literal["raise", "skip", "warn"]`, default `"raise"`) — Behaviour when a file fails to download or parse:
+  - `"raise"` — re-raises the exception immediately.
+  - `"skip"` — silently omits the file.
+  - `"warn"` — logs a warning and omits the file.
+- **`add_source_column`** (`bool`, default `True`) — Append a `_source` column to each file's rows containing its originating path.
+- **`max_concurrent`** (`int | None`, default `None`) — Additional concurrency cap for this call only. `None` applies no extra limit beyond the client-level semaphore.
+- **`return_status`** (`bool`, default `False`) — When `True`, return a two-element tuple instead of a single DataFrame.
+- **`**kwargs`** — Forwarded verbatim to `pandas.read_excel`.
+
+**Returns**
+
+- `pd.DataFrame` — Concatenated data from all successfully read files (`return_status=False`).
+- `tuple[pd.DataFrame, pd.DataFrame]` — `(combined_df, status_df)` when `return_status=True`. `status_df` has columns:
+  - `path` — file path.
+  - `status` — `"success"`, `"missing_sheet"`, or `"error"`.
+  - `error` — error message string, or empty string on success.
+
+**Raises**
+
+- **`ValueError`** — If `on_missing_sheet="raise"` and a sheet is not found.
+- **`Exception`** — Re-raises the download / parse exception if `on_error="raise"`.
+
+**Example**
+
+```python
+# Strict: any failure raises immediately
+df = await client.read_excel_many(["jan.xlsx", "feb.xlsx"], sheet="Sales")
+
+# Tolerant: warn and continue, then inspect which files failed
+df, status = await client.read_excel_many(
+    ["jan.xlsx", "feb.xlsx", "mar.xlsx"],
+    sheet="Sales*",
+    sheet_match="glob",
+    on_missing_sheet="warn",
+    on_error="warn",
+    return_status=True,
+)
+print(status[status["status"] != "success"])
+```
+
+---
+
+#### `GraphClient.read_csv_many`
+
+```python
+async def read_csv_many(
+    paths: list[str],
+    *,
+    on_error: Literal["raise", "skip", "warn"] = "raise",
+    add_source_column: bool = True,
+    max_concurrent: int | None = None,
+    return_status: bool = False,
+    **kwargs,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]
+```
+
+Read multiple CSV files concurrently and concatenate them into one DataFrame.
+
+**Parameters**
+
+- **`paths`** (`list[str]`) — Item paths relative to the drive root to read.
+- **`on_error`** (`Literal["raise", "skip", "warn"]`, default `"raise"`) — Behaviour when a file fails to download or parse:
+  - `"raise"` — re-raises the exception immediately.
+  - `"skip"` — silently omits the file.
+  - `"warn"` — logs a warning and omits the file.
+- **`add_source_column`** (`bool`, default `True`) — Append a `_source` column containing the originating path.
+- **`max_concurrent`** (`int | None`, default `None`) — Additional concurrency cap for this call only.
+- **`return_status`** (`bool`, default `False`) — When `True`, return `(combined_df, status_df)`. `status_df` columns: `path`, `status` (`"success"` | `"error"`), `error`.
+- **`**kwargs`** — Forwarded verbatim to `pandas.read_csv`.
+
+**Returns**
+
+- `pd.DataFrame` — Concatenated data (`return_status=False`).
+- `tuple[pd.DataFrame, pd.DataFrame]` — `(combined_df, status_df)` when `return_status=True`.
+
+**Raises**
+
+- **`Exception`** — Re-raises the download / parse exception if `on_error="raise"`.
+
+**Example**
+
+```python
+df, status = await client.read_csv_many(
+    ["exports/jan.csv", "exports/feb.csv"],
+    on_error="warn",
+    return_status=True,
+    sep=";",
+)
+failed = status[status["status"] == "error"]
+```
+
+---
+
+#### `GraphClient.list_excel_sheets`
+
+```python
+async def list_excel_sheets(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+) -> list[str]
+```
+
+Return the worksheet names of an Excel file without downloading its full content. Uses the Graph workbook API to read sheet metadata only.
+
+Exactly one identifier must be provided.
+
+**Parameters**
+
+- **`item_path`** (`str | None`, default `None`) — Path relative to the drive root.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link.
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+
+**Returns**
+
+`list[str]` — Worksheet names in workbook order.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+sheets = await client.list_excel_sheets(item_path="Finance/budget.xlsx")
+# ['Summary', 'Q1', 'Q2', 'Q3', 'Q4']
+```
+
+---
+
+### File & Folder Discovery
+
+---
+
+#### `GraphClient.walk`
+
+```python
+async def walk(
+    folder_path: str = "",
+    *,
+    pattern: str | None = None,
+    recursive: bool = True,
+) -> list[FileItem]
+```
+
+List files under a folder. Folders are not included in the result.
+
+**Parameters**
+
+- **`folder_path`** (`str`, default `""`) — Starting folder path relative to the drive root. Empty string means the drive root.
+- **`pattern`** (`str | None`, default `None`) — `fnmatch` glob applied to file names only (not full paths), e.g. `"*.xlsx"`. `None` returns all files.
+- **`recursive`** (`bool`, default `True`) — When `True`, descend into sub-folders concurrently. When `False`, only immediate children are scanned.
+
+**Returns**
+
+`list[FileItem]` — Matching files. Order is not guaranteed when `recursive=True`.
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+# All Excel files under "Reports", recursively
+files = await client.walk("Reports", pattern="*.xlsx")
+
+# Non-recursive — immediate children only
+files = await client.walk("Inbox", recursive=False)
+```
+
+---
+
+#### `GraphClient.list_files`
+
+```python
+async def list_files(folder_path: str = "") -> list[FileItem]
+```
+
+List the immediate children (files *and* folders) of a single folder. Non-recursive.
+
+**Parameters**
+
+- **`folder_path`** (`str`, default `""`) — Folder path relative to the drive root. Empty string means the drive root.
+
+**Returns**
+
+`list[FileItem]` — Direct children in the order returned by the API. Use `item.is_folder` to distinguish files from folders.
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+items   = await client.list_files("Projects")
+files   = [i for i in items if not i.is_folder]
+folders = [i for i in items if i.is_folder]
+```
+
+---
+
+#### `GraphClient.get_folder_tree`
+
+```python
+async def get_folder_tree(folder_path: str = "") -> TreeNode
+```
+
+Build and return a recursive `TreeNode` tree for a folder and all its contents. Internally calls `list_files` depth-first.
+
+**Parameters**
+
+- **`folder_path`** (`str`, default `""`) — Folder path relative to the drive root. Empty string means the drive root; the root node's `item` field will be `None`.
+
+**Returns**
+
+`TreeNode` — Root node of the tree. Call `.print()` for a console view.
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+tree = await client.get_folder_tree("Reports")
 tree.print()
+# 📁 Reports (0 bytes)
+#   📄 Q1.xlsx (45231 bytes)
 ```
 
-#### `get_metadata(*, item_path=None, share_url=None, item_id=None)` → `FileItem`
-Fetch metadata for a single item without downloading its content.
+---
+
+#### `GraphClient.get_metadata`
 
 ```python
-info = await client.get_metadata(item_path="shared/rules.txt")
-print(info.modified, info.size)
+async def get_metadata(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+) -> FileItem
 ```
 
-#### `delete_file(*, item_path=None, share_url=None, item_id=None)` → `None`
+Fetch metadata for a single file or folder without downloading its content. Exactly one identifier must be provided.
+
+**Parameters**
+
+- **`item_path`** (`str | None`, default `None`) — Path relative to the drive root.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link.
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+
+**Returns**
+
+`FileItem` — Metadata for the item.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors (e.g. 404 if the path does not exist).
+
+**Example**
 
 ```python
-await client.delete_file(item_path="temp_dump.txt")
+meta = await client.get_metadata(item_path="Reports/Q1.xlsx")
+print(f"{meta.size} bytes, last modified {meta.modified:%Y-%m-%d}")
 ```
 
-#### `move_file(source_path, dest_folder_path=None, new_name=None)` → `FileItem`
+---
+
+### File & Folder Management
+
+---
+
+#### `GraphClient.upload`
 
 ```python
-await client.move_file("draft.docx", dest_folder_path="published", new_name="final.docx")
+async def upload(
+    local_path: str | os.PathLike,
+    remote_path: str,
+) -> dict
 ```
 
-#### `create_folder(folder_path)` → `FileItem`
+Upload a local file to OneDrive / SharePoint. If the remote file already exists it is overwritten. The entire file is read into memory before upload; for files larger than ~4 MB consider using a Graph upload session directly.
+
+**Parameters**
+
+- **`local_path`** (`str | os.PathLike`) — Absolute or relative path to the local source file.
+- **`remote_path`** (`str`) — Destination path relative to the drive root, including file name (e.g. `"Uploads/report.xlsx"`).
+
+**Returns**
+
+`dict` — Raw Graph API `driveItem` response. Useful keys: `id`, `name`, `size`, `webUrl`.
+
+**Raises**
+
+- **`FileNotFoundError`** — If `local_path` does not exist or is not a file.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
 
 ```python
-await client.create_folder("2026/Q1")
+result = await client.upload("./output/report.xlsx", "Reports/2026/report.xlsx")
+print(result["webUrl"])
 ```
 
-#### `upload(local_path, remote_path)` → `dict`
-Upload a local file. Returns Graph dictionary response.
+---
+
+#### `GraphClient.delete_file`
 
 ```python
-await client.upload("./local_cache/data.bin", "cloud_backup/data.bin")
+async def delete_file(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+) -> None
+```
+
+Delete a file or folder. The item is moved to the OneDrive / SharePoint recycle bin. Exactly one identifier must be provided.
+
+**Parameters**
+
+- **`item_path`** (`str | None`, default `None`) — Path relative to the drive root.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link.
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+
+**Returns**
+
+`None`
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors (e.g. 404 if the item does not exist).
+
+**Example**
+
+```python
+await client.delete_file(item_path="temp/scratch.xlsx")
+```
+
+---
+
+#### `GraphClient.move_file`
+
+```python
+async def move_file(
+    source_path: str,
+    dest_folder_path: str | None = None,
+    new_name: str | None = None,
+) -> FileItem
+```
+
+Move and/or rename a file in a single API call. At least one of `dest_folder_path` or `new_name` must be provided.
+
+**Parameters**
+
+- **`source_path`** (`str`) — Current file path relative to the drive root.
+- **`dest_folder_path`** (`str | None`, default `None`) — Target folder path relative to the drive root. Pass `""` to move to the drive root. `None` keeps the current parent folder.
+- **`new_name`** (`str | None`, default `None`) — New file name including extension. `None` keeps the current name.
+
+**Returns**
+
+`FileItem` — Metadata of the item at its new location.
+
+**Raises**
+
+- **`ValueError`** — If neither `dest_folder_path` nor `new_name` is provided.
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+# Move and rename in one call
+item = await client.move_file(
+    "Drafts/report_v2.xlsx",
+    dest_folder_path="Published",
+    new_name="report_final.xlsx",
+)
+print(item.path)  # "Published/report_final.xlsx"
+
+# Rename only
+await client.move_file("Reports/old_name.xlsx", new_name="new_name.xlsx")
+```
+
+---
+
+#### `GraphClient.create_folder`
+
+```python
+async def create_folder(folder_path: str) -> FileItem
+```
+
+Create a new folder. Intermediate parent folders must already exist. If a folder with the same name already exists at the destination, Graph will auto-rename the new one (e.g. `Q1 (1)`).
+
+**Parameters**
+
+- **`folder_path`** (`str`) — Path of the folder to create, relative to the drive root (e.g. `"Reports/2026/Q1"`).
+
+**Returns**
+
+`FileItem` — Metadata of the newly created folder.
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors (e.g. 404 if the parent folder does not exist).
+
+**Example**
+
+```python
+folder = await client.create_folder("Reports/2026/Q1")
+print(folder.id)
 ```
 
 ---
 
 ### Communication
 
-#### `send_mail(to, subject, body, *, cc=None)` → `None`
-Send a plain-text email from the authenticated account's mailbox.
+---
 
-- `to` (`str | list[str]`): Recipient(s).
-- `cc` (`str | list[str] | None`): Optional CC recipient(s).
+#### `GraphClient.send_mail`
 
 ```python
-await client.send_mail("manager@company.com", "Pipeline Status", "Job completed.")
+async def send_mail(
+    to: str | list[str],
+    subject: str,
+    body: str,
+    *,
+    cc: str | list[str] | None = None,
+) -> None
 ```
 
-#### `send_teams_message(team_id, channel_id, text)` → `None`
+Send a plain-text email from the authenticated account's mailbox. The sent message is saved to Sent Items automatically.
+
+**Parameters**
+
+- **`to`** (`str | list[str]`) — Recipient email address or list of addresses.
+- **`subject`** (`str`) — Email subject line.
+- **`body`** (`str`) — Plain-text message body.
+- **`cc`** (`str | list[str] | None`, default `None`) — CC recipient(s). `None` sends no CC.
+
+**Returns**
+
+`None`
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors (e.g. 403 if the account lacks `Mail.Send` permission).
+
+**Example**
 
 ```python
-await client.send_teams_message("team-xyz", "channel-abc", "Pipeline failed!")
+await client.send_mail(
+    to=["analyst@company.com", "manager@company.com"],
+    subject="Daily ETL complete",
+    body="The pipeline finished successfully. See the report on SharePoint.",
+    cc="lead@company.com",
+)
 ```
 
-#### `get_teams_messages(team_id, channel_id, limit=10)` → `list[dict]`
+---
+
+#### `GraphClient.send_teams_message`
 
 ```python
-messages = await client.get_teams_messages("team-xyz", "channel-abc", limit=5)
+async def send_teams_message(
+    team_id: str,
+    channel_id: str,
+    text: str,
+) -> None
+```
+
+Post a plain-text message to a Teams channel.
+
+**Parameters**
+
+- **`team_id`** (`str`) — The Teams group ID (visible in Graph Explorer or in the Teams channel URL).
+- **`channel_id`** (`str`) — The channel ID within the team.
+- **`text`** (`str`) — Message body (plain text).
+
+**Returns**
+
+`None`
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+await client.send_teams_message(
+    team_id="19:abc...@thread.tacv2",
+    channel_id="19:xyz...@thread.tacv2",
+    text="Deployment finished successfully.",
+)
+```
+
+---
+
+#### `GraphClient.get_teams_messages`
+
+```python
+async def get_teams_messages(
+    team_id: str,
+    channel_id: str,
+    limit: int = 10,
+) -> list[dict]
+```
+
+Fetch the most recent messages from a Teams channel.
+
+**Parameters**
+
+- **`team_id`** (`str`) — The Teams group ID.
+- **`channel_id`** (`str`) — The channel ID within the team.
+- **`limit`** (`int`, default `10`) — Maximum number of messages to return.
+
+**Returns**
+
+`list[dict]` — Graph `chatMessage` objects in reverse-chronological order. Commonly used fields: `id`, `body.content`, `from.user.displayName`, `createdDateTime`.
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+messages = await client.get_teams_messages(
+    "19:abc...@thread.tacv2",
+    "19:xyz...@thread.tacv2",
+    limit=5,
+)
+for msg in messages:
+    print(msg["from"]["user"]["displayName"], ":", msg["body"]["content"])
+```
+
+---
+
+#### `GraphClient.list_chats`
+
+```python
+async def list_chats(limit: int = 50) -> list[dict]
+```
+
+List all chats (1-1, group, meeting) the authenticated account participates in, with member details expanded.
+
+**Parameters**
+
+- **`limit`** (`int`, default `50`) — Maximum number of chats to return.
+
+**Returns**
+
+`list[dict]` — Graph `chat` objects. Commonly used fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `str` | Chat ID — pass to `get_chat_messages` / `send_chat_message`. |
+| `chatType` | `str` | `"oneOnOne"`, `"group"`, or `"meeting"`. |
+| `topic` | `str \| None` | Chat display name (group chats only). |
+| `members` | `list[dict]` | Members with `displayName` and `userId`. |
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+chats = await client.list_chats()
+for chat in chats:
+    members = [m["displayName"] for m in chat.get("members", [])]
+    print(chat["chatType"], chat["id"], members)
+```
+
+---
+
+#### `GraphClient.get_chat_messages`
+
+```python
+async def get_chat_messages(
+    chat_id: str,
+    limit: int = 10,
+) -> list[dict]
+```
+
+Fetch the most recent messages from a Teams 1-1 or group chat.
+
+**Parameters**
+
+- **`chat_id`** (`str`) — Chat ID obtained from `list_chats()`.
+- **`limit`** (`int`, default `10`) — Maximum number of messages to return.
+
+**Returns**
+
+`list[dict]` — Graph `chatMessage` objects in reverse-chronological order. Commonly used fields: `id`, `body.content`, `from.user.displayName`, `createdDateTime`.
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+chats = await client.list_chats()
+chat_id = chats[0]["id"]
+
+messages = await client.get_chat_messages(chat_id, limit=20)
+for msg in messages:
+    print(msg["createdDateTime"], msg["from"]["user"]["displayName"], msg["body"]["content"])
+```
+
+---
+
+#### `GraphClient.send_chat_message`
+
+```python
+async def send_chat_message(chat_id: str, text: str) -> None
+```
+
+Post a plain-text message to a Teams 1-1 or group chat.
+
+**Parameters**
+
+- **`chat_id`** (`str`) — Chat ID obtained from `list_chats()`.
+- **`text`** (`str`) — Message body (plain text).
+
+**Returns**
+
+`None`
+
+**Raises**
+
+- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+
+**Example**
+
+```python
+await client.send_chat_message(chat_id, "ETL finished. Check the report on SharePoint.")
 ```
 
 ---
 
 ### Synchronous Helpers
 
+Convenience wrappers that call `asyncio.run()` internally. Intended for scripts, Prefect tasks, or any context without a running event loop.
+
+> **Note:** Do not call these from within an `async def` function or inside Jupyter — use the native `await` syntax instead.
+
+---
+
+#### `GraphClient.read_excel_sync(**kwargs)` → `pd.DataFrame`
+
+Synchronous wrapper for [`read_excel`](#graphclientread_excel). Accepts all the same keyword arguments.
+
 ```python
-df   = client.read_excel_sync(item_path="Reports/Q1.xlsx")
-df   = client.read_csv_sync(item_path="data.csv")
-data = client.download_sync(item_path="image.png")
+df = client.read_excel_sync(item_path="Reports/Q1.xlsx", sheet="Summary")
+```
+
+---
+
+#### `GraphClient.read_csv_sync(**kwargs)` → `pd.DataFrame`
+
+Synchronous wrapper for [`read_csv`](#graphclientread_csv). Accepts all the same keyword arguments.
+
+```python
+df = client.read_csv_sync(item_path="data/users.csv", sep=";")
+```
+
+---
+
+#### `GraphClient.download_sync(**kwargs)` → `bytes`
+
+Synchronous wrapper for [`download`](#graphclientdownload). Accepts all the same keyword arguments.
+
+```python
+data = client.download_sync(item_path="archive/data.bin")
 ```
