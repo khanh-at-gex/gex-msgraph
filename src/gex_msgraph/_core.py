@@ -65,8 +65,9 @@ class _TokenProvider:
     ) -> None:
         self._username = username
         self._password = password
-        self._app = msal.PublicClientApplication(
+        self._app = msal.ConfidentialClientApplication(
             client_id=client_id,
+            client_credential=client_secret,
             authority=_AUTHORITY_TEMPLATE.format(tenant_id=tenant_id),
         )
 
