@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -57,18 +58,21 @@ def encode_share_url(url: str) -> str:
 def build_resolution_url(
     kind: Literal["path", "share", "id"],
     value: str,
-    drive_id: str,
+    drive_root: str,
 ) -> str:
-    """Build the correct Graph endpoint for the identifier kind."""
+    """Build the correct Graph endpoint for the identifier kind.
+
+    `drive_root` is the URL fragment for the drive scope, e.g.
+    `/me/drive` (default OneDrive) or `/drives/{driveId}` (explicit).
+    """
     if kind == "path":
-        # Ensure path doesn't start with / for the root:/{path} format
         clean_path = value.lstrip("/")
-        return f"/drives/{drive_id}/root:/{clean_path}"
+        return f"{drive_root}/root:/{clean_path}"
     elif kind == "share":
         encoded_url = encode_share_url(value)
         return f"/shares/{encoded_url}/driveItem"
     elif kind == "id":
-        return f"/drives/{drive_id}/items/{value}"
+        return f"{drive_root}/items/{value}"
     raise ValueError(f"Unknown kind: {kind}")
 
 def match_sheet_name(
@@ -106,13 +110,18 @@ def parse_drive_item(item: dict[str, Any], parent_path: str = "") -> FileItem:
     is_folder = "folder" in item
     
     path_val = item.get("parentReference", {}).get("path", "")
+    # Graph returns the parent path as either "/drive/root:" (default OneDrive)
+    # or "/drives/{driveId}/root:" (explicit drive). Strip whichever applies.
+    rel_dir: str | None = None
     if path_val:
-        prefix = "/drive/root:"
-        if path_val.startswith(prefix):
-            rel_dir = path_val[len(prefix):].lstrip("/")
-            path = f"{rel_dir}/{name}" if rel_dir else name
-        else:
-            path = f"{parent_path}/{name}".lstrip("/") if parent_path else name
+        m = re.match(r"^/drives/[^/]+/root:", path_val)
+        if m:
+            rel_dir = path_val[m.end():].lstrip("/")
+        elif path_val.startswith("/drive/root:"):
+            rel_dir = path_val[len("/drive/root:"):].lstrip("/")
+
+    if rel_dir is not None:
+        path = f"{rel_dir}/{name}" if rel_dir else name
     else:
         path = f"{parent_path}/{name}".lstrip("/") if parent_path else name
 

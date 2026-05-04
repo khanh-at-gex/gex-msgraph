@@ -79,7 +79,8 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Read Excel by path:** `await client.read_excel(item_path="Folder/File.xlsx")`
 - **Read Excel by share link:** `await client.read_excel(share_url="https://tenant.sharepoint.com/.../File.xlsx")`
 - **Read CSV:** `await client.read_csv(item_path="data.csv")`
-- **Bulk read:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
+- **Bulk read Excel:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
+- **Bulk read CSV (with status logging):** `df, status_df = await client.read_csv_many(["A.csv", "B.csv"], on_error="skip", return_status=True)`
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
 - **Download raw bytes:** `await client.download(item_path="image.png")`
@@ -90,7 +91,7 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Delete File:** `await client.delete_file(item_path="File.xlsx")`
 - **Move/Rename File:** `await client.move_file("Old.xlsx", dest_folder_path="Archive", new_name="New.xlsx")`
 - **Create Folder:** `await client.create_folder("NewFolder")`
-- **Print Folder Tree:** 
+- **Print Folder Tree:**
   ```python
   tree = await client.get_folder_tree("Reports")
   tree.print()
@@ -128,3 +129,172 @@ Update the pin to `@v0.2.0` in `requirements.txt` or via `uv add "gex-msgraph @ 
 | KeyError | Check `.env` is loaded via `python-dotenv`. |
 | 403 Forbidden | Ensure account has SharePoint access. |
 | pip git error | Ensure git is installed and SSH agent is running. |
+
+---
+
+## API Reference
+
+### Instantiation
+
+#### `GraphClient(account=None, **kwargs)`
+Creates a new Graph API client.
+
+**Params:**
+- `account` (`str | None`): The prefix for environment variables (e.g. `ACCOUNT` will read `MS_ACCOUNT_CLIENT_ID`). Defaults to `"custom"`.
+- `client_id`, `client_secret`, `tenant_id`, `username`, `password` (`str | None`): Explicit credentials, overriding environment variables.
+- `default_site_id`, `default_drive_id` (`str | None`): The SharePoint site or Drive ID to target by default.
+- `max_concurrent` (`int | None`): Maximum concurrent async requests.
+- `request_timeout` (`float | None`): Timeout in seconds.
+
+**Example:**
+```python
+async with GraphClient("my_app") as client:
+    pass  # initialized with MS_MY_APP_CLIENT_ID, etc.
+```
+
+---
+
+### File Operations (Download/Read)
+
+#### `download(*, item_path=None, share_url=None, item_id=None)` → `bytes`
+Return raw file bytes. Exactly one identifier must be provided.
+
+```python
+data = await client.download(item_path="documents/report.pdf")
+with open("local_report.pdf", "wb") as f:
+    f.write(data)
+```
+
+#### `read_excel(*, item_path=None, share_url=None, item_id=None, sheet=0, **kwargs)` → `pd.DataFrame`
+Read an Excel file directly into a pandas DataFrame.
+
+- `sheet` (`str | int`): Sheet name or positional index.
+- `**kwargs`: Passed to `pandas.read_excel`.
+
+```python
+df = await client.read_excel(share_url="https://tenant.sharepoint.com/:x:/r/...", sheet="Data")
+```
+
+#### `read_csv(*, item_path=None, share_url=None, item_id=None, **kwargs)` → `pd.DataFrame`
+Read a CSV file directly into a pandas DataFrame. `**kwargs` passed to `pandas.read_csv`.
+
+```python
+df = await client.read_csv(item_path="data/users.csv", sep=";")
+```
+
+#### `read_excel_many(paths, *, sheet=0, sheet_match="exact", on_missing_sheet="raise", on_error="raise", add_source_column=True, max_concurrent=None, return_status=False, **kwargs)`
+Read many Excel files concurrently and concatenate into one DataFrame.
+
+- `paths` (`list[str]`): List of paths to read.
+- `sheet_match` (`Literal["exact", "ci", "glob"]`): How to match sheet name.
+- `on_missing_sheet` (`Literal["raise", "skip", "warn"]`): Behavior when sheet not found.
+- `on_error` (`Literal["raise", "skip", "warn"]`): Behavior when file fails.
+- `add_source_column` (`bool`): Append `_source` column with originating path.
+- `return_status` (`bool`): If true, returns `(combined_df, status_df)`.
+
+```python
+df = await client.read_excel_many(["jan.xlsx", "feb.xlsx"], sheet="Sales", on_error="skip")
+```
+
+#### `list_excel_sheets(*, item_path=None, share_url=None, item_id=None)` → `list[str]`
+List all worksheet names in an Excel file.
+
+```python
+sheets = await client.list_excel_sheets(item_path="finance.xlsx")
+# ['Summary', 'Q1', 'Q2', ...]
+```
+
+---
+
+### File/Folder Management
+
+#### `walk(folder_path="", *, pattern=None, recursive=True)` → `list[FileItem]`
+List files under a folder. Folders are traversed but not returned.
+
+```python
+files = await client.walk("archive", pattern="*.csv")
+```
+
+#### `list_files(folder_path="")` → `list[FileItem]`
+List immediate children (files and folders) of a single folder. Non-recursive.
+
+```python
+items = await client.list_files("projects")
+```
+
+#### `get_folder_tree(folder_path="")` → `TreeNode`
+Returns a recursive tree representation of a folder and all its contents.
+
+```python
+tree = await client.get_folder_tree()
+tree.print()
+```
+
+#### `get_metadata(*, item_path=None, share_url=None, item_id=None)` → `FileItem`
+Fetch metadata for a single item without downloading its content.
+
+```python
+info = await client.get_metadata(item_path="shared/rules.txt")
+print(info.modified, info.size)
+```
+
+#### `delete_file(*, item_path=None, share_url=None, item_id=None)` → `None`
+
+```python
+await client.delete_file(item_path="temp_dump.txt")
+```
+
+#### `move_file(source_path, dest_folder_path=None, new_name=None)` → `FileItem`
+
+```python
+await client.move_file("draft.docx", dest_folder_path="published", new_name="final.docx")
+```
+
+#### `create_folder(folder_path)` → `FileItem`
+
+```python
+await client.create_folder("2026/Q1")
+```
+
+#### `upload(local_path, remote_path)` → `dict`
+Upload a local file. Returns Graph dictionary response.
+
+```python
+await client.upload("./local_cache/data.bin", "cloud_backup/data.bin")
+```
+
+---
+
+### Communication
+
+#### `send_mail(to, subject, body, *, cc=None)` → `None`
+Send a plain-text email from the authenticated account's mailbox.
+
+- `to` (`str | list[str]`): Recipient(s).
+- `cc` (`str | list[str] | None`): Optional CC recipient(s).
+
+```python
+await client.send_mail("manager@company.com", "Pipeline Status", "Job completed.")
+```
+
+#### `send_teams_message(team_id, channel_id, text)` → `None`
+
+```python
+await client.send_teams_message("team-xyz", "channel-abc", "Pipeline failed!")
+```
+
+#### `get_teams_messages(team_id, channel_id, limit=10)` → `list[dict]`
+
+```python
+messages = await client.get_teams_messages("team-xyz", "channel-abc", limit=5)
+```
+
+---
+
+### Synchronous Helpers
+
+```python
+df   = client.read_excel_sync(item_path="Reports/Q1.xlsx")
+df   = client.read_csv_sync(item_path="data.csv")
+data = client.download_sync(item_path="image.png")
+```
