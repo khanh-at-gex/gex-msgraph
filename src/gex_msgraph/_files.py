@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+
 @dataclass(frozen=True)
 class FileItem:
     name: str
@@ -16,11 +17,12 @@ class FileItem:
     modified: datetime
     is_folder: bool
 
+
 @dataclass
 class TreeNode:
     item: FileItem | None
     children: list["TreeNode"]
-    
+
     def print(self, indent: int = 0) -> None:
         """Print the tree structure visually."""
         prefix = "  " * indent
@@ -29,9 +31,10 @@ class TreeNode:
             print(f"{prefix}{icon} {self.item.name} ({self.item.size} bytes)")
         else:
             print(f"{prefix}📁 (Root)")
-            
+
         for child in self.children:
             child.print(indent + 1)
+
 
 def validate_identifier(
     item_path: str | None = None,
@@ -42,18 +45,20 @@ def validate_identifier(
     provided = sum(x is not None for x in (item_path, share_url, item_id))
     if provided != 1:
         raise ValueError("Must provide exactly one of: item_path, share_url, item_id")
-    
+
     if item_path is not None:
         return "path"
     if share_url is not None:
         return "share"
     return "id"
 
+
 def encode_share_url(url: str) -> str:
     """Encode a SharePoint share URL for Microsoft Graph."""
     # Graph API requirement: 'u!' + base64url(url) without padding
     b64 = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii")
     return f"u!{b64.rstrip('=')}"
+
 
 def build_resolution_url(
     kind: Literal["path", "share", "id"],
@@ -75,14 +80,14 @@ def build_resolution_url(
         return f"{drive_root}/items/{value}"
     raise ValueError(f"Unknown kind: {kind}")
 
+
 def match_sheet_name(
     sheets: list[str],
     requested: str | int,
-    mode: Literal["exact", "ci", "glob"]
+    mode: Literal["exact", "ci", "glob"],
 ) -> str | int | None:
     """Find matching sheet name; return None if no match."""
     if isinstance(requested, int):
-        # Positional index: just return it if it's within bounds
         if 0 <= requested < len(sheets) or -len(sheets) <= requested < 0:
             return requested
         return None
@@ -104,11 +109,12 @@ def match_sheet_name(
 
     return None
 
+
 def parse_drive_item(item: dict[str, Any], parent_path: str = "") -> FileItem:
     """Convert Graph API response dict into FileItem."""
     name = item.get("name", "")
     is_folder = "folder" in item
-    
+
     path_val = item.get("parentReference", {}).get("path", "")
     # Graph returns the parent path as either "/drive/root:" (default OneDrive)
     # or "/drives/{driveId}/root:" (explicit drive). Strip whichever applies.
@@ -132,7 +138,7 @@ def parse_drive_item(item: dict[str, Any], parent_path: str = "") -> FileItem:
         modified = datetime.fromisoformat(mod_str)
     else:
         modified = datetime.min
-        
+
     return FileItem(
         name=name,
         path=path,

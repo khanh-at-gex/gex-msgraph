@@ -3,6 +3,10 @@
 Async Python wrapper for Microsoft Graph API (M365: OneDrive, SharePoint, Outlook, Teams).
 Full API reference → [USAGE.md](USAGE.md).
 
+**Companion files**
+- `AGENTS.md` — user-facing quick reference for junior devs (Gemini, Codex, etc.). Keep in sync when adding public methods.
+- `USAGE.md` — full API reference (signatures, Parameters, Returns, Raises, Examples).
+
 ## Commands
 
 ```bash
@@ -54,6 +58,8 @@ df, status = await client.read_excel_many(
 2. Add test in `tests/test_client.py` using `respx` to mock Graph responses
 3. Add recipe (one-liner) to **Recipes** section in `USAGE.md`
 4. Add full entry (signature + Parameters + Returns + Raises + Example) to **API Reference** in `USAGE.md`
+5. Add a snippet to `AGENTS.md` under the relevant section
+6. If the method returns a new type, export it from `__init__.py`
 
 ## Adding a new identifier type
 

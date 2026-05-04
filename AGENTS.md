@@ -2,6 +2,8 @@
 
 > Async Python wrapper for Microsoft Graph API. Provides clean access to M365 services (OneDrive, SharePoint, Outlook, Teams) from scripts, FastAPI, Prefect, or Jupyter notebooks.
 
+Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode`
+
 ## Setup
 
 Install:

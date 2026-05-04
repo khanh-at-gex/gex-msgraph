@@ -17,7 +17,7 @@ python -m venv .venv
 pip install "gex-msgraph @ git+ssh://git@github.com/companyg/gex-msgraph.git@v0.1.0"
 ```
 
-**Workflow A: pip + venv (Ubuntu)**
+**Workflow B: pip + venv (Ubuntu)**
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -136,6 +136,8 @@ Update the pin to `@v0.2.0` in `requirements.txt` or via `uv add "gex-msgraph @ 
 ---
 
 ## API Reference
+
+Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode`
 
 ---
 
