@@ -31,7 +31,7 @@ src/gex_msgraph/
 
 - **All Graph HTTP calls MUST go through `_request()`** — it handles auth header injection, semaphore, and retry.
 - **Never log credentials** — tokens, passwords, secrets. Logger is `logging.getLogger("gex_msgraph")`.
-- **Do not add dependencies** without discussion (`httpx`, `msal`, `pandas`, `openpyxl`, `python-dotenv` only).
+- **Do not add dependencies** without discussion (`httpx`, `msal`, `pandas`, `openpyxl`, `python-calamine`, `python-dotenv` only).
 - **`_TokenProvider.get_token()` is synchronous** — always call via `asyncio.to_thread()` inside async context.
 - Retry only on **429 and 5xx**. Never retry 4xx (auth/permission errors should surface immediately).
 

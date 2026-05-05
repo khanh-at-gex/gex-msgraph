@@ -320,7 +320,7 @@ Download an Excel file and parse one sheet into a pandas DataFrame. Exactly one 
 - **`share_url`** (`str | None`, default `None`) — SharePoint share link.
 - **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
 - **`sheet`** (`str | int`, default `0`) — Sheet to read. An integer is a zero-based positional index; a string is the exact sheet name.
-- **`**kwargs`** — Forwarded verbatim to `pandas.read_excel` (e.g. `header`, `usecols`, `dtype`, `skiprows`). **Default engine:** `"calamine"` if `python-calamine` is installed (`pip install gex-msgraph[calamine]`), otherwise pandas' built-in default. Override with `engine="openpyxl"`.
+- **`**kwargs`** — Forwarded verbatim to `pandas.read_excel` (e.g. `header`, `usecols`, `dtype`, `skiprows`). **Default engine:** `"calamine"` (fast Rust-based parser, hard dep). Override with `engine="openpyxl"` if needed.
 
 **Returns**
 
@@ -426,7 +426,7 @@ Read multiple Excel files concurrently and concatenate them into one DataFrame.
 - **`add_source_column`** (`bool`, default `True`) — Append a `_source` column to each file's rows containing its originating path.
 - **`max_concurrent`** (`int | None`, default `None`) — Additional concurrency cap for this call only. `None` applies no extra limit beyond the client-level semaphore.
 - **`return_status`** (`bool`, default `False`) — When `True`, return a two-element tuple instead of a single DataFrame.
-- **`**kwargs`** — Forwarded verbatim to `pandas.read_excel` (e.g. `usecols="A:M"`, `header`, `skiprows`, `dtype`, `nrows`). The `engine` kwarg is honored and applied to the underlying `pd.ExcelFile`. **Default engine:** `"calamine"` if `python-calamine` is installed (`pip install gex-msgraph[calamine]`), otherwise pandas' built-in default (openpyxl). Pass `engine="openpyxl"` explicitly to opt out.
+- **`**kwargs`** — Forwarded verbatim to `pandas.read_excel` (e.g. `usecols="A:M"`, `header`, `skiprows`, `dtype`, `nrows`). The `engine` kwarg is honored and applied to the underlying `pd.ExcelFile`. **Default engine:** `"calamine"` (fast Rust-based parser, hard dep). Override with `engine="openpyxl"` if needed.
 
 **Returns**
 
