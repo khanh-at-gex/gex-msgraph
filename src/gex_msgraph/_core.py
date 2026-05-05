@@ -327,11 +327,13 @@ class GraphClient:
         import pandas as pd
         from gex_msgraph._files import match_sheet_name
 
+        engine = read_excel_kwargs.pop("engine", None)
+
         async def _process_one(path: str) -> tuple[pd.DataFrame | None, str, str]:
             try:
                 data = await self.download(item_path=path)
                 buf = io.BytesIO(data)
-                xls = pd.ExcelFile(buf)
+                xls = pd.ExcelFile(buf, engine=engine) if engine else pd.ExcelFile(buf)
                 matched = match_sheet_name(xls.sheet_names, sheet, sheet_match)
             except Exception as e:
                 if on_error == "raise":
