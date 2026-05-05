@@ -76,6 +76,13 @@ df, status = await client.read_excel_many(
     return_status=True,                       # returns (combined_df, status_df)
 )
 
+# Engine: defaults to "calamine" if installed (pip install gex-msgraph[calamine]),
+# otherwise pandas' default (openpyxl). Override explicitly if needed:
+df = await client.read_excel_many(
+    ["jan.xlsx", "feb.xlsx"], sheet="Sales",
+    usecols="A:M", engine="openpyxl",
+)
+
 # Bulk read CSV (concurrent)
 df, status = await client.read_csv_many(
     ["exports/jan.csv", "exports/feb.csv"],

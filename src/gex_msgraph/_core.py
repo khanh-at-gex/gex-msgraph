@@ -23,6 +23,18 @@ _DEFAULT_SCOPE = ["https://graph.microsoft.com/.default"]
 _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_MAX_CONCURRENT = 10
 _DEFAULT_MAX_RETRIES = 3
+
+
+def _default_excel_engine() -> str | None:
+    """Return "calamine" if python-calamine is installed, else None.
+
+    Calamine is significantly faster than openpyxl on .xlsx workbooks.
+    """
+    try:
+        import python_calamine  # noqa: F401
+    except ImportError:
+        return None
+    return "calamine"
 _BACKOFF_CAP = 30.0
 
 
@@ -273,6 +285,7 @@ class GraphClient:
             item_path=item_path, share_url=share_url, item_id=item_id
         )
         buf = io.BytesIO(data)
+        read_excel_kwargs.setdefault("engine", _default_excel_engine())
         return pd.read_excel(buf, sheet_name=sheet, **read_excel_kwargs)
 
     async def read_csv(
@@ -327,7 +340,7 @@ class GraphClient:
         import pandas as pd
         from gex_msgraph._files import match_sheet_name
 
-        engine = read_excel_kwargs.pop("engine", None)
+        engine = read_excel_kwargs.pop("engine", _default_excel_engine())
 
         async def _process_one(path: str) -> tuple[pd.DataFrame | None, str, str]:
             try:
