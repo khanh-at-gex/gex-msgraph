@@ -24,6 +24,10 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
 ]
+calamine = [
+    "python-calamine>=0.2",
+    "pandas>=2.2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gex_msgraph"]
