@@ -63,6 +63,9 @@ df = await client.read_excel(share_url="https://tenant.sharepoint.com/:x:/r/..."
 # Read CSV → DataFrame
 df = await client.read_csv(item_path="data/users.csv", sep=";")
 
+# Read Parquet → DataFrame
+df = await client.read_parquet(item_path="data/users.parquet")
+
 # Download raw bytes
 data = await client.download(item_path="images/logo.png")
 
@@ -91,6 +94,16 @@ df, status = await client.read_csv_many(
 # List worksheet names (no download)
 sheets = await client.list_excel_sheets(item_path="Finance/budget.xlsx")
 # → ['Summary', 'Q1', 'Q2', ...]
+
+# Search files across the drive
+files = await client.search_files("budget")          # → list[FileItem]
+```
+
+## Bulk read sync wrappers (scripts / no event loop)
+
+```python
+df = client.read_excel_many_sync(["jan.xlsx", "feb.xlsx"], sheet="Sales")
+df = client.read_csv_many_sync(["jan.csv", "feb.csv"])
 ```
 
 ## File & folder discovery
@@ -118,8 +131,17 @@ tree.print()
 # Upload local file
 result = await client.upload("./local/report.xlsx", "Reports/2026/report.xlsx")
 
+# Bulk upload (concurrent)
+results = await client.upload_many([
+    ("./local/jan.xlsx", "Reports/jan.xlsx"),
+    ("./local/feb.xlsx", "Reports/feb.xlsx"),
+])
+
 # Delete (moves to recycle bin)
 await client.delete_file(item_path="temp/scratch.xlsx")
+
+# Copy file
+await client.copy_file("Reports/Q1.xlsx", "Archive", new_name="Q1_backup.xlsx")
 
 # Move and/or rename
 await client.move_file("Drafts/v2.xlsx", dest_folder_path="Published", new_name="final.xlsx")
@@ -127,17 +149,46 @@ await client.move_file("Reports/old.xlsx", new_name="new.xlsx")  # rename only
 
 # Create folder
 folder = await client.create_folder("Reports/2026/Q1")
+
+# Check existence
+if await client.exists(item_path="Reports/Q1.xlsx"):
+    ...
+
+# Get a sharing link
+url = await client.get_share_link(item_path="Reports/Q1.xlsx")
+url = await client.get_share_link(item_path="Reports/Q1.xlsx", link_type="edit", scope="anonymous")
 ```
 
 ## Communication
 
 ```python
-# Send email
+# List inbox messages
+msgs = await client.list_mail(limit=10)
+# msgs[0] keys: id, subject, from, receivedDateTime, bodyPreview, hasAttachments
+msgs = await client.list_mail(limit=20, folder="sentitems")
+```
+
+```python
+# Send plain-text email
 await client.send_mail(
     to=["analyst@company.com", "manager@company.com"],
     subject="Pipeline complete",
     body="Job finished.",
-    cc="lead@company.com",   # optional
+    cc="lead@company.com",                            # optional
+)
+
+# Send HTML email with attachments
+await client.send_mail(
+    to="analyst@company.com",
+    subject="Report",
+    body="<h2>Done</h2><p>See attached.</p>",
+    body_type="html",                                 # "text" (default) | "html"
+    attachments=[
+        "./output/report.xlsx",                       # local file path
+        ("data.csv", df.to_csv().encode()),            # (filename, bytes) tuple
+        {"item_path": "Reports/Q1.xlsx"},             # SharePoint file by path
+        {"share_url": "https://tenant.sharepoint.com/:x:/r/..."},  # by share link
+    ],
 )
 
 # Teams channel

@@ -1,3 +1,5 @@
+import base64
+import json
 import pytest
 import httpx
 import respx
@@ -126,6 +128,71 @@ async def test_send_mail(env_vars, mock_token):
         assert "Subj" in payload
 
 
+async def test_send_mail_html(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.post("https://graph.microsoft.com/v1.0/me/sendMail")
+        route.mock(return_value=httpx.Response(202))
+        async with GraphClient("das_u1") as client:
+            await client.send_mail(
+                to="a@b.com", subject="S", body="<b>Hi</b>", body_type="html"
+            )
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["message"]["body"]["contentType"] == "HTML"
+
+
+async def test_send_mail_attachment_path(env_vars, mock_token, tmp_path):
+    f = tmp_path / "report.txt"
+    f.write_bytes(b"hello")
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.post("https://graph.microsoft.com/v1.0/me/sendMail")
+        route.mock(return_value=httpx.Response(202))
+        async with GraphClient("das_u1") as client:
+            await client.send_mail(to="a@b.com", subject="S", body="body", attachments=[f])
+    payload = json.loads(route.calls[0].request.content)
+    att = payload["message"]["attachments"][0]
+    assert att["name"] == "report.txt"
+    assert base64.b64decode(att["contentBytes"]) == b"hello"
+
+
+async def test_send_mail_attachment_bytes(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.post("https://graph.microsoft.com/v1.0/me/sendMail")
+        route.mock(return_value=httpx.Response(202))
+        async with GraphClient("das_u1") as client:
+            await client.send_mail(
+                to="a@b.com", subject="S", body="body",
+                attachments=[("data.csv", b"col1,col2\n1,2")],
+            )
+    payload = json.loads(route.calls[0].request.content)
+    att = payload["message"]["attachments"][0]
+    assert att["name"] == "data.csv"
+    assert att["contentType"]  # platform-dependent; just ensure it is set
+    assert base64.b64decode(att["contentBytes"]) == b"col1,col2\n1,2"
+
+
+async def test_send_mail_attachment_sharepoint(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/Reports/Q1.xlsx").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://cdn.example.com/Q1.xlsx"}
+            )
+        )
+        rm.get("https://cdn.example.com/Q1.xlsx").mock(
+            return_value=httpx.Response(200, content=b"xlsxbytes")
+        )
+        route = rm.post("https://graph.microsoft.com/v1.0/me/sendMail")
+        route.mock(return_value=httpx.Response(202))
+        async with GraphClient("das_u1") as client:
+            await client.send_mail(
+                to="a@b.com", subject="S", body="body",
+                attachments=[{"item_path": "Reports/Q1.xlsx"}],
+            )
+    payload = json.loads(route.calls[0].request.content)
+    att = payload["message"]["attachments"][0]
+    assert att["name"] == "Q1.xlsx"
+    assert base64.b64decode(att["contentBytes"]) == b"xlsxbytes"
+
+
 async def test_send_teams_message(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
         route = rm.post(
@@ -142,6 +209,125 @@ async def test_send_teams_message(env_vars, mock_token):
         req = route.calls[0].request
         payload = req.read().decode("utf-8")
         assert "Hello Teams" in payload
+
+
+async def test_copy_file(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/src.xlsx:/copy")
+        route.mock(return_value=httpx.Response(202))
+        async with GraphClient("das_u1") as client:
+            await client.copy_file("src.xlsx", "Archive", new_name="src_copy.xlsx")
+    payload = json.loads(route.calls[0].request.content)
+    assert "Archive" in payload["parentReference"]["path"]
+    assert payload["name"] == "src_copy.xlsx"
+
+
+async def test_exists_true(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
+            return_value=httpx.Response(200, json={"name": "file.txt", "size": 1})
+        )
+        async with GraphClient("das_u1") as client:
+            assert await client.exists(item_path="file.txt") is True
+
+
+async def test_exists_false(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/missing.txt").mock(
+            return_value=httpx.Response(404)
+        )
+        async with GraphClient("das_u1") as client:
+            assert await client.exists(item_path="missing.txt") is False
+
+
+async def test_upload_many(env_vars, mock_token, tmp_path):
+    f1 = tmp_path / "a.txt"
+    f2 = tmp_path / "b.txt"
+    f1.write_bytes(b"aaa")
+    f2.write_bytes(b"bbb")
+    with respx.mock(assert_all_called=False) as rm:
+        rm.put("https://graph.microsoft.com/v1.0/me/drive/root:/remote/a.txt:/content").mock(
+            return_value=httpx.Response(201, json={"name": "a.txt"})
+        )
+        rm.put("https://graph.microsoft.com/v1.0/me/drive/root:/remote/b.txt:/content").mock(
+            return_value=httpx.Response(201, json={"name": "b.txt"})
+        )
+        async with GraphClient("das_u1") as client:
+            results = await client.upload_many(
+                [(f1, "remote/a.txt"), (f2, "remote/b.txt")]
+            )
+    assert len(results) == 2
+    assert results[0]["name"] == "a.txt"
+
+
+async def test_get_share_link(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.post(
+            "https://graph.microsoft.com/v1.0/me/drive/root:/report.xlsx:/createLink"
+        )
+        route.mock(
+            return_value=httpx.Response(
+                200, json={"link": {"webUrl": "https://tenant.sharepoint.com/shared/link"}}
+            )
+        )
+        async with GraphClient("das_u1") as client:
+            url = await client.get_share_link(item_path="report.xlsx")
+    assert url == "https://tenant.sharepoint.com/shared/link"
+
+
+async def test_read_parquet(env_vars, mock_token):
+    import io
+    import pandas as pd
+
+    df_orig = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+    buf = io.BytesIO()
+    df_orig.to_parquet(buf, index=False)
+    parquet_bytes = buf.getvalue()
+
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/data.parquet").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://dl.url/data.parquet"}
+            )
+        )
+        rm.get("https://dl.url/data.parquet").mock(
+            return_value=httpx.Response(200, content=parquet_bytes)
+        )
+        async with GraphClient("das_u1") as client:
+            df = await client.read_parquet(item_path="data.parquet")
+    assert list(df.columns) == ["a", "b"]
+    assert len(df) == 2
+
+
+async def test_list_mail(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+            "?$top=5&$select=id,subject,from,receivedDateTime,bodyPreview,hasAttachments"
+        ).mock(
+            return_value=httpx.Response(
+                200, json={"value": [{"id": "m1", "subject": "Hello"}]}
+            )
+        )
+        async with GraphClient("das_u1") as client:
+            msgs = await client.list_mail(limit=5)
+    assert len(msgs) == 1
+    assert msgs[0]["subject"] == "Hello"
+
+
+async def test_search_files(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/drive/root/search(q='budget')?$top=25"
+        ).mock(
+            return_value=httpx.Response(
+                200, json={"value": [{"name": "budget.xlsx", "size": 100}]}
+            )
+        )
+        async with GraphClient("das_u1") as client:
+            results = await client.search_files("budget")
+    assert len(results) == 1
+    assert results[0].name == "budget.xlsx"
 
 
 def test_sync_wrappers(env_vars, mock_token):
