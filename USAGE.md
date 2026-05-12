@@ -81,16 +81,22 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Read CSV:** `await client.read_csv(item_path="data.csv")`
 - **Bulk read Excel:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
 - **Bulk read CSV (with status logging):** `df, status_df = await client.read_csv_many(["A.csv", "B.csv"], on_error="skip", return_status=True)`
+- **Read Parquet:** `await client.read_parquet(item_path="data.parquet")`
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
+- **Search files:** `await client.search_files("budget")`
 - **Download raw bytes:** `await client.download(item_path="image.png")`
 - **Upload:** `await client.upload("local.txt", "remote.txt")`
+- **Bulk upload:** `await client.upload_many([("local/a.xlsx", "remote/a.xlsx"), ...])`
 
 ### File & Folder Management
 - **Get File Metadata (Size, Date):** `meta = await client.get_metadata(item_path="File.xlsx")`
 - **Delete File:** `await client.delete_file(item_path="File.xlsx")`
+- **Copy File:** `await client.copy_file("File.xlsx", "Archive", new_name="File_copy.xlsx")`
 - **Move/Rename File:** `await client.move_file("Old.xlsx", dest_folder_path="Archive", new_name="New.xlsx")`
 - **Create Folder:** `await client.create_folder("NewFolder")`
+- **Check Exists:** `exists = await client.exists(item_path="File.xlsx")`
+- **Get Share Link:** `url = await client.get_share_link(item_path="File.xlsx")`
 - **Print Folder Tree:**
   ```python
   tree = await client.get_folder_tree("Reports")
@@ -99,6 +105,7 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **List Excel Sheets (Without downloading):** `sheets = await client.list_excel_sheets(item_path="File.xlsx")`
 
 ### Communications
+- **List inbox:** `msgs = await client.list_mail(limit=10)`
 - **Send mail:** `await client.send_mail("test@test.com", "Subj", "Body")`
 - **Send Teams channel:** `await client.send_teams_message("team1", "chan1", "Hello")`
 - **Read Teams channel:** `msgs = await client.get_teams_messages("team1", "chan1", limit=10)`
@@ -859,18 +866,25 @@ async def send_mail(
     subject: str,
     body: str,
     *,
+    body_type: Literal["text", "html"] = "text",
     cc: str | list[str] | None = None,
+    attachments: list[str | os.PathLike | tuple[str, bytes] | dict[str, str]] | None = None,
 ) -> None
 ```
 
-Send a plain-text email from the authenticated account's mailbox. The sent message is saved to Sent Items automatically.
+Send an email from the authenticated account's mailbox. Supports plain-text or HTML body and file attachments. The sent message is saved to Sent Items automatically.
 
 **Parameters**
 
 - **`to`** (`str | list[str]`) — Recipient email address or list of addresses.
 - **`subject`** (`str`) — Email subject line.
-- **`body`** (`str`) — Plain-text message body.
+- **`body`** (`str`) — Message body (plain text or HTML depending on `body_type`).
+- **`body_type`** (`Literal["text", "html"]`, default `"text"`) — Content type of `body`. Use `"html"` to send rich HTML email.
 - **`cc`** (`str | list[str] | None`, default `None`) — CC recipient(s). `None` sends no CC.
+- **`attachments`** (`list | None`, default `None`) — Files to attach. Each item is one of:
+  - `str | os.PathLike` — path to a local file; filename inferred from the path.
+  - `(filename, bytes)` tuple — attach in-memory content (e.g. a DataFrame exported to CSV).
+  - `dict` with exactly one of `item_path`, `share_url`, or `item_id` — fetched from SharePoint/OneDrive via `download()`.
 
 **Returns**
 
@@ -883,11 +897,25 @@ Send a plain-text email from the authenticated account's mailbox. The sent messa
 **Example**
 
 ```python
+# Plain text
 await client.send_mail(
     to=["analyst@company.com", "manager@company.com"],
     subject="Daily ETL complete",
-    body="The pipeline finished successfully. See the report on SharePoint.",
+    body="The pipeline finished successfully.",
     cc="lead@company.com",
+)
+
+# HTML body + mixed attachments
+await client.send_mail(
+    to="analyst@company.com",
+    subject="ETL report",
+    body="<h2>Done</h2><p>Rows processed: <b>1,204</b></p>",
+    body_type="html",
+    attachments=[
+        "./output/summary.xlsx",                      # local file
+        ("log.csv", log_df.to_csv().encode()),         # in-memory bytes
+        {"item_path": "Reports/Q1.xlsx"},             # SharePoint file
+    ],
 )
 ```
 

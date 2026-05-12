@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -294,6 +297,23 @@ class GraphClient:
         )
         buf = io.BytesIO(data)
         return pd.read_csv(buf, **read_csv_kwargs)
+
+    async def read_parquet(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+        **kwargs: Any,
+    ) -> "pd.DataFrame":
+        """Read a Parquet file directly into a DataFrame."""
+        import io
+        import pandas as pd
+
+        data = await self.download(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
+        return pd.read_parquet(io.BytesIO(data), **kwargs)
 
     async def download(
         self,
@@ -612,6 +632,53 @@ class GraphClient:
         resp = await self._request("POST", url, json=payload)
         return parse_drive_item(resp.json())
 
+    async def copy_file(
+        self,
+        source_path: str,
+        dest_folder_path: str,
+        new_name: str | None = None,
+    ) -> None:
+        """Copy a file to a new location. Graph executes the copy asynchronously."""
+        import urllib.parse
+
+        drive_root = self._drive_root()
+        source_clean = source_path.lstrip("/")
+        dest_clean = dest_folder_path.lstrip("/")
+        encoded_source = urllib.parse.quote(source_clean)
+        url = f"{drive_root}/root:/{encoded_source}:/copy"
+
+        payload: dict[str, Any] = {
+            "parentReference": {
+                "path": (
+                    f"{drive_root}/root:/{dest_clean}"
+                    if dest_clean
+                    else f"{drive_root}/root"
+                )
+            }
+        }
+        if new_name is not None:
+            payload["name"] = new_name
+
+        await self._request("POST", url, json=payload)
+
+    async def exists(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+    ) -> bool:
+        """Return True if the item exists, False on 404. Re-raises other HTTP errors."""
+        try:
+            await self.get_metadata(
+                item_path=item_path, share_url=share_url, item_id=item_id
+            )
+            return True
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return False
+            raise
+
     async def list_excel_sheets(
         self,
         *,
@@ -628,6 +695,24 @@ class GraphClient:
         suffix = ":/workbook/worksheets" if kind == "path" else "/workbook/worksheets"
         resp = await self._request("GET", base + suffix)
         return [str(sheet["name"]) for sheet in resp.json().get("value", [])]
+
+    async def get_share_link(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+        link_type: Literal["view", "edit"] = "view",
+        scope: Literal["anonymous", "organization"] = "organization",
+    ) -> str:
+        """Create a sharing link for an item. Returns the webUrl string."""
+        kind, base = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
+        suffix = ":/createLink" if kind == "path" else "/createLink"
+        payload: dict[str, Any] = {"type": link_type, "scope": scope}
+        resp = await self._request("POST", base + suffix, json=payload)
+        return str(resp.json()["link"]["webUrl"])
 
     async def get_folder_tree(self, folder_path: str = "") -> "TreeNode":
         """Return a recursive tree representation of a folder."""
@@ -650,6 +735,23 @@ class GraphClient:
 
         await _build_tree(folder_path, root_node)
         return root_node
+
+    async def search_files(
+        self,
+        query: str,
+        *,
+        limit: int = 25,
+    ) -> list[FileItem]:
+        """Search for files across the drive by name or content."""
+        import urllib.parse
+        from gex_msgraph._files import parse_drive_item
+
+        encoded_query = urllib.parse.quote(query)
+        url = f"{self._drive_root()}/root/search(q='{encoded_query}')?$top={limit}"
+        results: list[FileItem] = []
+        async for item in self._iter_paginated(url):
+            results.append(parse_drive_item(item))
+        return results
 
     async def upload(
         self, local_path: str | os.PathLike[str], remote_path: str
@@ -679,26 +781,88 @@ class GraphClient:
         )
         return cast(dict[str, Any], resp.json())
 
+    async def upload_many(
+        self,
+        items: list[tuple[str | os.PathLike, str]],
+        *,
+        on_error: Literal["raise", "skip", "warn"] = "raise",
+        return_status: bool = False,
+    ) -> "list[dict] | tuple[list[dict], pd.DataFrame]":
+        """Upload multiple local files concurrently."""
+        import pandas as pd
+
+        async def _upload_one(
+            local: str | os.PathLike, remote: str
+        ) -> tuple[dict[str, Any] | None, str, str]:
+            try:
+                result = await self.upload(local, remote)
+                return result, "success", ""
+            except Exception as e:
+                if on_error == "raise":
+                    raise
+                if on_error == "warn":
+                    logger.warning("Failed to upload %s: %s", remote, e)
+                return None, "error", str(e)
+
+        raw_results = await asyncio.gather(
+            *[_upload_one(local, remote) for local, remote in items]
+        )
+
+        results: list[dict[str, Any]] = []
+        status_records = []
+        for (_, remote), (result, status, msg) in zip(items, raw_results):
+            if result is not None:
+                results.append(result)
+            status_records.append({"path": str(remote), "status": status, "error": msg})
+
+        if return_status:
+            return results, pd.DataFrame(status_records)
+        return results
+
     async def send_mail(
         self,
         to: str | list[str],
         subject: str,
         body: str,
         *,
+        body_type: Literal["text", "html"] = "text",
         cc: str | list[str] | None = None,
+        attachments: list[str | os.PathLike | tuple[str, bytes] | dict[str, str]] | None = None,
     ) -> None:
-        """Send a plain-text email from the account's mailbox."""
+        """Send an email from the account's mailbox."""
 
         def _make_recipients(addrs: str | list[str]) -> list[dict[str, Any]]:
             if isinstance(addrs, str):
                 addrs = [addrs]
             return [{"emailAddress": {"address": a}} for a in addrs]
 
+        async def _make_attachment(item: str | os.PathLike | tuple[str, bytes] | dict[str, str]) -> dict[str, Any]:
+            if isinstance(item, tuple):
+                name, data = item
+            elif isinstance(item, dict):
+                data = await self.download(**item)  # type: ignore[arg-type]
+                if "item_path" in item:
+                    name = item["item_path"].split("/")[-1]
+                else:
+                    meta = await self.get_metadata(**item)  # type: ignore[arg-type]
+                    name = meta.name
+            else:
+                p = Path(item)
+                name = p.name
+                data = p.read_bytes()
+            mime, _ = mimetypes.guess_type(name)
+            return {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": name,
+                "contentType": mime or "application/octet-stream",
+                "contentBytes": base64.b64encode(data).decode(),
+            }
+
         payload: dict[str, Any] = {
             "message": {
                 "subject": subject,
                 "body": {
-                    "contentType": "Text",
+                    "contentType": "HTML" if body_type == "html" else "Text",
                     "content": body,
                 },
                 "toRecipients": _make_recipients(to),
@@ -709,7 +873,24 @@ class GraphClient:
         if cc:
             payload["message"]["ccRecipients"] = _make_recipients(cc)
 
+        if attachments:
+            payload["message"]["attachments"] = [
+                await _make_attachment(a) for a in attachments
+            ]
+
         await self._request("POST", "/me/sendMail", json=payload)
+
+    async def list_mail(
+        self,
+        limit: int = 20,
+        *,
+        folder: str = "inbox",
+    ) -> list[dict[str, Any]]:
+        """List messages from a mail folder (default: inbox)."""
+        select = "id,subject,from,receivedDateTime,bodyPreview,hasAttachments"
+        url = f"/me/mailFolders/{folder}/messages?$top={limit}&$select={select}"
+        resp = await self._request("GET", url)
+        return cast(list[dict[str, Any]], resp.json().get("value", []))
 
     async def send_teams_message(
         self,
@@ -762,3 +943,13 @@ class GraphClient:
 
     def download_sync(self, **kw: Any) -> bytes:
         return asyncio.run(self.download(**kw))
+
+    def read_excel_many_sync(
+        self, paths: list[str], **kw: Any
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
+        return asyncio.run(self.read_excel_many(paths, **kw))
+
+    def read_csv_many_sync(
+        self, paths: list[str], **kw: Any
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
+        return asyncio.run(self.read_csv_many(paths, **kw))
