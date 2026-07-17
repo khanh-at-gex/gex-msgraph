@@ -22,18 +22,22 @@ mypy src
 
 ```
 src/gex_msgraph/
-├── _core.py    # GraphClient + _TokenProvider + retry logic
-├── _files.py   # FileItem, TreeNode, URL resolution, sheet matching
-└── __init__.py # Public exports: GraphClient, FileItem
+├── _core.py        # GraphClient + _TokenProvider + retry logic
+├── _files.py       # FileItem, TreeNode, URL resolution, sheet matching
+├── _exceptions.py  # GraphError hierarchy (subclasses httpx.HTTPStatusError)
+└── __init__.py     # Public exports: GraphClient, FileItem, exceptions
 ```
 
 ## Invariants — never break these
 
 - **All Graph HTTP calls MUST go through `_request()`** — it handles auth header injection, semaphore, and retry.
+  - Exception: `_stream_to_bytes` (used by `download`) fetches Graph's pre-authenticated `downloadUrl`, which must NOT get a Bearer header, so it can't go through `_request()`. It keeps its own 429/5xx retry loop reusing `_compute_backoff`/`_DEFAULT_MAX_RETRIES` — keep both retry loops in sync if backoff behavior changes.
 - **Never log credentials** — tokens, passwords, secrets. Logger is `logging.getLogger("gex_msgraph")`.
-- **Do not add dependencies** without discussion (`httpx`, `msal`, `pandas`, `openpyxl`, `python-calamine`, `python-dotenv` only).
+- **Do not add dependencies** without discussion (`httpx`, `msal`, `pandas`, `openpyxl`, `python-calamine` only; `python-dotenv` is an optional extra, never import it in `src/`).
 - **`_TokenProvider.get_token()` is synchronous** — always call via `asyncio.to_thread()` inside async context.
 - Retry only on **429 and 5xx**. Never retry 4xx (auth/permission errors should surface immediately).
+- **Raise `GraphError` subclasses** (via `raise_graph_error` in `_exceptions.py`) for HTTP failures, never bare `raise_for_status()`. `GraphError` must keep subclassing `httpx.HTTPStatusError` — consumer code depends on it.
+- The chunked-upload PUTs (`_put_chunk_with_retry`) and `_stream_to_path` share `_stream_to_bytes`'s no-Bearer/retry contract — keep all three in sync with `_request`'s backoff behavior.
 
 ## Common patterns
 

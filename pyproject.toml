@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gex-msgraph"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Async Python wrapper around Microsoft Graph API"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,17 +14,23 @@ dependencies = [
     "pandas>=2.2",
     "openpyxl>=3.1",
     "python-calamine>=0.2",
-    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
+dotenv = [
+    "python-dotenv>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
     "ruff>=0.6",
     "mypy>=1.10",
+    "python-dotenv>=1.0",
 ]
+
+[tool.hatch.version]
+path = "src/gex_msgraph/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gex_msgraph"]

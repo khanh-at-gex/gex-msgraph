@@ -16,6 +16,7 @@ class FileItem:
     size: int
     modified: datetime
     is_folder: bool
+    webUrl: str | None = None
 
 
 @dataclass
@@ -146,4 +147,5 @@ def parse_drive_item(item: dict[str, Any], parent_path: str = "") -> FileItem:
         size=item.get("size", 0),
         modified=modified,
         is_folder=is_folder,
+        webUrl=item.get("webUrl") or None,
     )

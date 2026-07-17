@@ -6,7 +6,7 @@
 - Git + SSH key for GitHub
 
 ## 2. Credentials
-Ask IT for a service account. You need: Client ID, Client Secret, Tenant ID, Username, Password.
+Ask IT for a service account. You need: Client ID, Client Secret, Tenant ID, and — for delegated (ROPC) auth — Username and Password. Omit username/password entirely to use app-only (client credentials) auth instead; see the Authentication flows section in the API Reference for the app-only limitations (no `/me/*` endpoints, `default_drive_id` required).
 
 ## 3. Install in your project
 
@@ -84,16 +84,18 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Read Parquet:** `await client.read_parquet(item_path="data.parquet")`
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
-- **Search files:** `await client.search_files("budget")`
+- **Search files:** `await client.search_files("budget", limit=25)` — `limit` is a hard cap on the returned list, not just a page-size hint.
 - **Download raw bytes:** `await client.download(item_path="image.png")`
-- **Upload:** `await client.upload("local.txt", "remote.txt")`
-- **Bulk upload:** `await client.upload_many([("local/a.xlsx", "remote/a.xlsx"), ...])`
+- **Download large file to disk:** `await client.download(item_path="big.parquet", to_path="big.parquet")`
+- **Upload (any size — >4 MiB chunks automatically):** `await client.upload("local.txt", "remote.txt")`
+- **Bulk upload:** `await client.upload_many([("local/a.xlsx", "remote/a.xlsx"), ...], max_concurrent=5)`
 
 ### File & Folder Management
 - **Get File Metadata (Size, Date):** `meta = await client.get_metadata(item_path="File.xlsx")`
 - **Delete File:** `await client.delete_file(item_path="File.xlsx")`
-- **Copy File:** `await client.copy_file("File.xlsx", "Archive", new_name="File_copy.xlsx")`
-- **Move/Rename File:** `await client.move_file("Old.xlsx", dest_folder_path="Archive", new_name="New.xlsx")`
+- **Copy File:** `await client.copy_file(item_path="File.xlsx", dest_folder_path="Archive", new_name="File_copy.xlsx")`
+- **Copy File and wait for result:** `item = await client.copy_file(item_path="File.xlsx", dest_folder_path="Archive", wait=True)`
+- **Move/Rename File:** `await client.move_file(item_path="Old.xlsx", dest_folder_path="Archive", new_name="New.xlsx")`
 - **Create Folder:** `await client.create_folder("NewFolder")`
 - **Check Exists:** `exists = await client.exists(item_path="File.xlsx")`
 - **Get Share Link:** `url = await client.get_share_link(item_path="File.xlsx")`
@@ -136,15 +138,42 @@ Update the pin to `@v0.2.0` in `requirements.txt` or via `uv add "gex-msgraph @ 
 ## 14. Troubleshooting
 | Symptom | Fix |
 |---|---|
-| KeyError | Check `.env` is loaded via `python-dotenv`. |
-| 403 Forbidden | Ensure account has SharePoint access. |
+| KeyError | Env vars not set. If you use a `.env` file, install `python-dotenv` yourself (`pip install python-dotenv` or the `gex-msgraph[dotenv]` extra — it is no longer a hard dependency since v0.3.0) and call `load_dotenv()` before creating the client. |
+| `PermissionDeniedError` (403) | Ensure account has SharePoint access. Under app-only auth, check the app has *application* permissions and `default_drive_id` is set. |
+| `GraphSyncInLoopError` | You called a `*_sync` method inside Jupyter or an async app — use `await client.method(...)` directly instead. |
 | pip git error | Ensure git is installed and SSH agent is running. |
 
 ---
 
 ## API Reference
 
-Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode`
+Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode, GraphError, AuthError, PermissionDeniedError, NotFoundError, RateLimitExhaustedError, GraphAuthenticationError, GraphSyncInLoopError`
+
+---
+
+### Exceptions
+
+All Graph HTTP failures raise a **`GraphError`** subclass. `GraphError` itself subclasses `httpx.HTTPStatusError`, so pre-v0.3.0 code that catches `httpx.HTTPStatusError` keeps working unchanged, and `.request` / `.response` remain available.
+
+- **`GraphError`** — base; also raised directly for unmapped 4xx statuses (e.g. 400).
+- **`AuthError`** — 401 Unauthorized (token invalid/expired/insufficient).
+- **`PermissionDeniedError`** — 403 Forbidden.
+- **`NotFoundError`** — 404 Not Found.
+- **`RateLimitExhaustedError`** — a 429/5xx persisted through all retry attempts.
+- **`GraphAuthenticationError`** (plain `Exception`) — MSAL token acquisition failed before any HTTP call; no request/response attached.
+- **`GraphSyncInLoopError`** (`RuntimeError`) — a `*_sync` method was called from inside a running event loop (Jupyter, async frameworks).
+
+```python
+from gex_msgraph import GraphClient, NotFoundError, GraphError
+
+async with GraphClient("das_u1") as client:
+    try:
+        df = await client.read_excel(item_path="Reports/Q1.xlsx")
+    except NotFoundError:
+        print("File does not exist")
+    except GraphError as e:
+        print(f"Graph call failed: {e.response.status_code}")
+```
 
 ---
 
@@ -160,6 +189,7 @@ Immutable dataclass representing a file or folder in OneDrive / SharePoint.
 - **`size`** (`int`) — Size in bytes. `0` for folders.
 - **`modified`** (`datetime`) — Last modification time, timezone-aware UTC.
 - **`is_folder`** (`bool`) — `True` when the item is a folder.
+- **`webUrl`** (`str | None`) — Graph's `driveItem.webUrl` (e.g. a `Doc.aspx` page or a normal SharePoint/OneDrive URL). Use this to build Office Online embed URLs (`?action=embedview`) for an iframe — it's a real item URL, not a sharing link, so it won't be blocked by X-Frame-Options/CSP the way [`get_share_link`](#graphclientget_share_link)'s `/:x:/` links are. `None` when Graph doesn't return the field.
 
 ---
 
@@ -195,7 +225,12 @@ tree.print()
 
 ### `GraphClient`
 
-Async client for Microsoft Graph API. Manages authentication (MSAL ROPC flow), connection pooling, semaphore-based concurrency, and automatic retry on 429 / 5xx responses (up to 3 attempts, exponential backoff capped at 30 s).
+Async client for Microsoft Graph API. Manages authentication (delegated ROPC or app-only client-credentials flow), connection pooling, semaphore-based concurrency, and automatic retry on 429 / 5xx responses (up to 3 attempts, exponential backoff capped at 30 s).
+
+#### Authentication flows
+
+- **Delegated (ROPC)** — provide `username` + `password` along with `client_id`/`client_secret`/`tenant_id`. The client acts as that signed-in user; all methods work.
+- **App-only (client credentials)** — omit **both** `username` and `password`. The client acts as the application itself, with *application* permissions instead of delegated ones. **Constraint:** `/me/*` endpoints have no meaning without a signed-in user, so under app-only auth `send_mail`, `list_mail`, `list_chats`, `get_chat_messages`, `send_chat_message` do not work, and all drive operations require `default_drive_id` to be set (the `/me/drive` default cannot resolve). Use app-only for drive-scoped automation on a known SharePoint drive; use ROPC when you need mail/Teams or `/me/drive`.
 
 #### `GraphClient.__init__`
 
@@ -208,7 +243,6 @@ GraphClient(
     tenant_id: str | None = None,
     username: str | None = None,
     password: str | None = None,
-    default_site_id: str | None = None,
     default_drive_id: str | None = None,
     max_concurrent: int | None = None,
     request_timeout: float | None = None,
@@ -217,49 +251,47 @@ GraphClient(
 
 **Parameters**
 
-- **`account`** (`str | None`, default `None`) — Env-var prefix. When set to e.g. `"das_u1"`, the following variables are read: `MS_DAS_U1_CLIENT_ID`, `MS_DAS_U1_CLIENT_SECRET`, `MS_DAS_U1_TENANT_ID`, `MS_DAS_U1_USERNAME`, `MS_DAS_U1_PASSWORD`. Keyword arguments below override any env var. When `None`, all five credentials must be passed explicitly; `account` is recorded as `"custom"`.
-- **`client_id`** (`str | None`, default `None`) — Azure app registration client ID. Overrides `MS_<ACCOUNT>_CLIENT_ID`.
-- **`client_secret`** (`str | None`, default `None`) — Azure app client secret. Overrides `MS_<ACCOUNT>_CLIENT_SECRET`.
-- **`tenant_id`** (`str | None`, default `None`) — Azure tenant (directory) ID. Overrides `MS_<ACCOUNT>_TENANT_ID`.
-- **`username`** (`str | None`, default `None`) — Service account UPN (e.g. `svc@company.com`). Overrides `MS_<ACCOUNT>_USERNAME`.
-- **`password`** (`str | None`, default `None`) — Service account password. Overrides `MS_<ACCOUNT>_PASSWORD`.
-- **`default_site_id`** (`str | None`, default `None`) — SharePoint site ID (informational; not currently used in URL routing).
-- **`default_drive_id`** (`str | None`, default `None`) — Drive ID. When set, all drive-scoped URLs use `/drives/{id}` instead of `/me/drive`. Readable from `MS_<ACCOUNT>_DEFAULT_DRIVE_ID`.
+- **`account`** (`str | None`, default `None`) — Env-var prefix. When set to e.g. `"das_u1"`, the following variables are read: `MS_DAS_U1_CLIENT_ID`, `MS_DAS_U1_CLIENT_SECRET`, `MS_DAS_U1_TENANT_ID`, `MS_DAS_U1_USERNAME`, `MS_DAS_U1_PASSWORD`. Keyword arguments below override any env var. When `None`, credentials must be passed explicitly; `account` is recorded as `"custom"`.
+- **`client_id`** (`str | None`, default `None`) — Azure app registration client ID. Overrides `MS_<ACCOUNT>_CLIENT_ID`. Required.
+- **`client_secret`** (`str | None`, default `None`) — Azure app client secret. Overrides `MS_<ACCOUNT>_CLIENT_SECRET`. Required.
+- **`tenant_id`** (`str | None`, default `None`) — Azure tenant (directory) ID. Overrides `MS_<ACCOUNT>_TENANT_ID`. Required.
+- **`username`** (`str | None`, default `None`) — Service account UPN (e.g. `svc@company.com`). Overrides `MS_<ACCOUNT>_USERNAME`. Provide together with `password` for delegated (ROPC) auth; omit both for app-only auth.
+- **`password`** (`str | None`, default `None`) — Service account password. Overrides `MS_<ACCOUNT>_PASSWORD`. Paired with `username`.
+- **`default_drive_id`** (`str | None`, default `None`) — Drive ID. When set, all drive-scoped URLs use `/drives/{id}` instead of `/me/drive`. Readable from `MS_<ACCOUNT>_DEFAULT_DRIVE_ID`. **Required under app-only auth.**
 - **`max_concurrent`** (`int | None`, default `10`) — Maximum simultaneous in-flight Graph requests per client instance. Readable from `MS_<ACCOUNT>_MAX_CONCURRENT`.
 - **`request_timeout`** (`float | None`, default `30.0`) — Per-request HTTP timeout in seconds. Readable from `MS_<ACCOUNT>_REQUEST_TIMEOUT`.
 
 **Raises**
 
-- **`KeyError`** — If any required credential (`client_id`, `client_secret`, `tenant_id`, `username`, `password`) is neither provided explicitly nor found in the environment.
+- **`KeyError`** — If `client_id`, `client_secret`, or `tenant_id` is neither provided explicitly nor found in the environment.
+- **`ValueError`** — If only one of `username` / `password` is provided (they must come as a pair, or both be absent for app-only auth), or if app-only auth is used without `default_drive_id`.
 
 **Notes**
 
-Use as an async context manager to ensure the underlying HTTP client is closed properly. For scripts, call `close()` manually or use the `_sync` wrappers.
+Use as an async context manager to ensure the underlying HTTP client is closed properly. For synchronous scripts using the `*_sync` wrappers, call `close_sync()` when done. `default_site_id` was removed in v0.3.0 (it was accepted but never used).
 
 **Example**
 
 ```python
-# From env vars
+# From env vars (delegated)
 async with GraphClient("das_u1") as client:
     df = await client.read_excel(item_path="Reports/Q1.xlsx")
 
-# Explicit credentials
+# Explicit credentials, app-only (no username/password)
 client = GraphClient(
     client_id="...",
     client_secret="...",
     tenant_id="...",
-    username="svc@company.com",
-    password="...",
-    default_drive_id="b!abc123",
+    default_drive_id="b!abc123",  # required for app-only
     max_concurrent=5,
 )
 ```
 
 ---
 
-#### `GraphClient.close()`
+#### `GraphClient.close()` / `GraphClient.close_sync()`
 
-Close the underlying HTTP client. Safe to call multiple times. Called automatically when the client is used as an async context manager.
+`close()` (async) closes the underlying HTTP client; safe to call multiple times; called automatically when the client is used as an async context manager. `close_sync()` is the synchronous companion for scripts that only use the `*_sync` wrappers — it also stops the background event loop those wrappers run on.
 
 ---
 
@@ -275,26 +307,29 @@ async def download(
     item_path: str | None = None,
     share_url: str | None = None,
     item_id: str | None = None,
-) -> bytes
+    to_path: str | os.PathLike | None = None,
+) -> bytes | Path
 ```
 
-Download a file and return its raw content as bytes. Exactly one of the three identifier parameters must be provided.
+Download a file. By default returns its raw content as bytes; with `to_path` set, streams the body to disk in chunks (never fully buffered in memory) and returns the written `Path`. Exactly one of the three identifier parameters must be provided.
 
 **Parameters**
 
 - **`item_path`** (`str | None`, default `None`) — Path relative to the drive root, e.g. `"Documents/report.pdf"`.
 - **`share_url`** (`str | None`, default `None`) — SharePoint share link (full `https://…` URL from "Copy link").
 - **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID.
+- **`to_path`** (`str | os.PathLike | None`, default `None`) — Local destination file. When given, the download is streamed to this file instead of being returned as bytes. Use for large files.
 
 **Returns**
 
-`bytes` — Raw file content.
+`bytes` — Raw file content (when `to_path` is `None`).
+`Path` — The written destination (when `to_path` is given).
 
 **Raises**
 
 - **`ValueError`** — If not exactly one identifier is provided.
 - **`RuntimeError`** — If the Graph API response does not contain a `@microsoft.graph.downloadUrl`.
-- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors (e.g. 403 Forbidden, 404 Not Found).
+- **`GraphError`** (subclass of `httpx.HTTPStatusError`) — On non-retryable HTTP errors (e.g. `PermissionDeniedError`, `NotFoundError`) or when retries are exhausted (`RateLimitExhaustedError`).
 
 **Example**
 
@@ -302,6 +337,9 @@ Download a file and return its raw content as bytes. Exactly one of the three id
 data = await client.download(item_path="images/logo.png")
 with open("logo.png", "wb") as f:
     f.write(data)
+
+# Large file: stream straight to disk
+path = await client.download(item_path="exports/huge.parquet", to_path="huge.parquet")
 ```
 
 ---
@@ -391,6 +429,28 @@ Download a CSV file and parse it into a pandas DataFrame. Exactly one identifier
 
 ```python
 df = await client.read_csv(item_path="data/users.csv", sep=";", encoding="utf-8-sig")
+```
+
+---
+
+#### `GraphClient.read_parquet`
+
+```python
+async def read_parquet(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+    **kwargs,
+) -> pd.DataFrame
+```
+
+Download a Parquet file and parse it into a pandas DataFrame. Exactly one identifier must be provided. Extra keyword arguments are forwarded to `pandas.read_parquet` (requires `pyarrow` or `fastparquet` in your project).
+
+**Example**
+
+```python
+df = await client.read_parquet(item_path="exports/facts.parquet", columns=["id", "amount"])
 ```
 
 ---
@@ -707,6 +767,68 @@ print(f"{meta.size} bytes, last modified {meta.modified:%Y-%m-%d}")
 
 ---
 
+#### `GraphClient.exists`
+
+```python
+async def exists(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+) -> bool
+```
+
+Check whether an item exists without raising on 404. Exactly one identifier must be provided.
+
+**Returns**
+
+`bool` — `True` if the item exists, `False` if Graph returns 404.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one identifier is provided.
+- **`GraphError`** — On any HTTP error other than 404 (e.g. `PermissionDeniedError`).
+
+**Example**
+
+```python
+if not await client.exists(item_path="Reports/Q1.xlsx"):
+    print("missing!")
+```
+
+---
+
+#### `GraphClient.search_files`
+
+```python
+async def search_files(
+    query: str,
+    *,
+    limit: int = 25,
+) -> list[FileItem]
+```
+
+Search files across the drive by name or content, using Graph's drive search. `limit` is a hard cap on the number of returned items (pagination stops once reached); `limit <= 0` returns `[]` without a request.
+
+**Parameters**
+
+- **`query`** (`str`) — Search text.
+- **`limit`** (`int`, default `25`) — Maximum number of results returned.
+
+**Returns**
+
+`list[FileItem]` — Matching items (files and folders), at most `limit`.
+
+**Example**
+
+```python
+hits = await client.search_files("budget", limit=10)
+for f in hits:
+    print(f.path)
+```
+
+---
+
 ### File & Folder Management
 
 ---
@@ -720,7 +842,7 @@ async def upload(
 ) -> dict
 ```
 
-Upload a local file to OneDrive / SharePoint. If the remote file already exists it is overwritten. The entire file is read into memory before upload; for files larger than ~4 MB consider using a Graph upload session directly.
+Upload a local file to OneDrive / SharePoint. If the remote file already exists it is overwritten. Files up to ~4 MiB use a single PUT; larger files are transparently uploaded via a Graph upload session in 10 MiB chunks, so there is no practical size limit.
 
 **Parameters**
 
@@ -741,6 +863,43 @@ Upload a local file to OneDrive / SharePoint. If the remote file already exists 
 ```python
 result = await client.upload("./output/report.xlsx", "Reports/2026/report.xlsx")
 print(result["webUrl"])
+```
+
+---
+
+#### `GraphClient.upload_many`
+
+```python
+async def upload_many(
+    items: list[tuple[str | os.PathLike, str]],
+    *,
+    on_error: Literal["raise", "skip", "warn"] = "raise",
+    max_concurrent: int | None = None,
+    return_status: bool = False,
+) -> list[dict] | tuple[list[dict], pd.DataFrame]
+```
+
+Upload multiple local files concurrently. Each item is a `(local_path, remote_path)` tuple.
+
+**Parameters**
+
+- **`items`** — List of `(local_path, remote_path)` pairs.
+- **`on_error`** (default `"raise"`) — `"raise"` aborts on first failure; `"skip"` continues silently; `"warn"` continues and logs a warning.
+- **`max_concurrent`** (`int | None`, default `None`) — Optional bound on concurrent uploads (added in v0.2.1; unbounded when `None`, subject to the client-wide semaphore).
+- **`return_status`** (default `False`) — When `True`, also return a status DataFrame with `path` / `status` / `error` columns.
+
+**Returns**
+
+`list[dict]` — Graph `driveItem` dicts for successful uploads; or `(results, status_df)` when `return_status=True`.
+
+**Example**
+
+```python
+results, status = await client.upload_many(
+    [("./a.xlsx", "Reports/a.xlsx"), ("./b.xlsx", "Reports/b.xlsx")],
+    on_error="warn",
+    return_status=True,
+)
 ```
 
 ---
@@ -785,17 +944,24 @@ await client.delete_file(item_path="temp/scratch.xlsx")
 
 ```python
 async def move_file(
-    source_path: str,
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
     dest_folder_path: str | None = None,
     new_name: str | None = None,
 ) -> FileItem
 ```
 
-Move and/or rename a file in a single API call. At least one of `dest_folder_path` or `new_name` must be provided.
+Move and/or rename a file in a single API call. The source accepts any of the three identifier kinds (exactly one); the destination is always a folder path. At least one of `dest_folder_path` or `new_name` must be provided.
+
+> **Breaking change in v0.3.0**: the positional `source_path` parameter was replaced by the keyword-only `item_path` / `share_url` / `item_id` trio, matching every other method. Migrate `move_file("a.xlsx", ...)` → `move_file(item_path="a.xlsx", ...)`.
 
 **Parameters**
 
-- **`source_path`** (`str`) — Current file path relative to the drive root.
+- **`item_path`** (`str | None`, default `None`) — Current file path relative to the drive root.
+- **`share_url`** (`str | None`, default `None`) — SharePoint share link identifying the source item.
+- **`item_id`** (`str | None`, default `None`) — Microsoft Graph item ID of the source item.
 - **`dest_folder_path`** (`str | None`, default `None`) — Target folder path relative to the drive root. Pass `""` to move to the drive root. `None` keeps the current parent folder.
 - **`new_name`** (`str | None`, default `None`) — New file name including extension. `None` keeps the current name.
 
@@ -805,22 +971,80 @@ Move and/or rename a file in a single API call. At least one of `dest_folder_pat
 
 **Raises**
 
-- **`ValueError`** — If neither `dest_folder_path` nor `new_name` is provided.
-- **`httpx.HTTPStatusError`** — On non-retryable HTTP errors.
+- **`ValueError`** — If not exactly one source identifier is provided, or if neither `dest_folder_path` nor `new_name` is provided.
+- **`GraphError`** — On non-retryable HTTP errors.
 
 **Example**
 
 ```python
 # Move and rename in one call
 item = await client.move_file(
-    "Drafts/report_v2.xlsx",
+    item_path="Drafts/report_v2.xlsx",
     dest_folder_path="Published",
     new_name="report_final.xlsx",
 )
 print(item.path)  # "Published/report_final.xlsx"
 
 # Rename only
-await client.move_file("Reports/old_name.xlsx", new_name="new_name.xlsx")
+await client.move_file(item_path="Reports/old_name.xlsx", new_name="new_name.xlsx")
+
+# Move by item id
+await client.move_file(item_id="01ABC123", dest_folder_path="Archive")
+```
+
+---
+
+#### `GraphClient.copy_file`
+
+```python
+async def copy_file(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+    dest_folder_path: str,
+    new_name: str | None = None,
+    wait: bool = False,
+    wait_timeout: float = 60.0,
+) -> FileItem | None
+```
+
+Copy a file to a new location. Graph executes the copy as an asynchronous job. With `wait=False` (default) the method returns `None` immediately after the job is accepted; with `wait=True` it polls the job's monitor URL until completion and returns the new item's `FileItem`.
+
+> **Breaking change in v0.3.0**: the positional `source_path` parameter was replaced by the keyword-only `item_path` / `share_url` / `item_id` trio. Migrate `copy_file("a.xlsx", "Archive")` → `copy_file(item_path="a.xlsx", dest_folder_path="Archive")`.
+
+**Parameters**
+
+- **`item_path`** / **`share_url`** / **`item_id`** — Source item; exactly one must be provided.
+- **`dest_folder_path`** (`str`) — Target folder path relative to the drive root. Pass `""` for the drive root.
+- **`new_name`** (`str | None`, default `None`) — Name for the copy. `None` keeps the source name.
+- **`wait`** (`bool`, default `False`) — When `True`, poll until the copy job completes and return the new `FileItem`.
+- **`wait_timeout`** (`float`, default `60.0`) — Maximum seconds to poll when `wait=True`.
+
+**Returns**
+
+`FileItem | None` — `None` when `wait=False`; the new item's metadata when `wait=True`.
+
+**Raises**
+
+- **`ValueError`** — If not exactly one source identifier is provided.
+- **`GraphError`** — If the copy job reports `failed` (when `wait=True`), or on non-retryable HTTP errors.
+- **`TimeoutError`** — If the job does not complete within `wait_timeout` (when `wait=True`).
+
+**Example**
+
+```python
+# Fire-and-forget
+await client.copy_file(item_path="Reports/Q1.xlsx", dest_folder_path="Archive")
+
+# Wait for the copy and get the new item
+item = await client.copy_file(
+    item_path="Reports/Q1.xlsx",
+    dest_folder_path="Archive",
+    new_name="Q1_backup.xlsx",
+    wait=True,
+)
+print(item.id, item.webUrl)
 ```
 
 ---
@@ -854,7 +1078,72 @@ print(folder.id)
 
 ---
 
+#### `GraphClient.get_share_link`
+
+```python
+async def get_share_link(
+    *,
+    item_path: str | None = None,
+    share_url: str | None = None,
+    item_id: str | None = None,
+    link_type: Literal["view", "edit"] = "view",
+    scope: Literal["anonymous", "organization"] = "organization",
+) -> str
+```
+
+Create a sharing link for an item and return its `webUrl`. Exactly one identifier must be provided.
+
+> Sharing links (`/:x:/…`) are for people to open in a browser. They are **blocked inside iframes** by SharePoint — for Office Online embedding use `FileItem.webUrl` instead.
+
+**Parameters**
+
+- **`item_path`** / **`share_url`** / **`item_id`** — Target item; exactly one.
+- **`link_type`** (default `"view"`) — `"view"` (read-only) or `"edit"`.
+- **`scope`** (default `"organization"`) — `"organization"` (tenant-only) or `"anonymous"` (anyone with the link, if tenant policy allows).
+
+**Returns**
+
+`str` — The sharing link URL.
+
+**Example**
+
+```python
+url = await client.get_share_link(item_path="Reports/Q1.xlsx", link_type="edit")
+```
+
+---
+
 ### Communication
+
+---
+
+#### `GraphClient.list_mail`
+
+```python
+async def list_mail(
+    limit: int = 20,
+    *,
+    folder: str = "inbox",
+) -> list[dict]
+```
+
+List messages from a mail folder. Requires delegated (ROPC) auth — this is a `/me/*` endpoint.
+
+**Parameters**
+
+- **`limit`** (`int`, default `20`) — Maximum number of messages.
+- **`folder`** (`str`, default `"inbox"`) — Well-known folder name (`"inbox"`, `"sentitems"`, `"drafts"`, …) or a folder ID.
+
+**Returns**
+
+`list[dict]` — Message dicts with `id`, `subject`, `from`, `receivedDateTime`, `bodyPreview`, `hasAttachments`.
+
+**Example**
+
+```python
+for msg in await client.list_mail(10):
+    print(msg["receivedDateTime"], msg["subject"])
+```
 
 ---
 
@@ -1105,9 +1394,9 @@ await client.send_chat_message(chat_id, "ETL finished. Check the report on Share
 
 ### Synchronous Helpers
 
-Convenience wrappers that call `asyncio.run()` internally. Intended for scripts, Prefect tasks, or any context without a running event loop.
+Convenience wrappers for scripts, Prefect tasks, or any context without a running event loop. Since v0.3.0 they run on a dedicated background event loop (created lazily on the first sync call and reused for the client's lifetime), so repeated sync calls on the same client are safe. Call `close_sync()` when done.
 
-> **Note:** Do not call these from within an `async def` function or inside Jupyter — use the native `await` syntax instead.
+> **Note:** Calling these from within an `async def` function or inside Jupyter raises `GraphSyncInLoopError` — use the native `await` syntax there instead. Pick one usage mode per client instance: either async (`async with` / `await`) or sync (`*_sync` + `close_sync()`), not both.
 
 ---
 
@@ -1131,10 +1420,30 @@ df = client.read_csv_sync(item_path="data/users.csv", sep=";")
 
 ---
 
-#### `GraphClient.download_sync(**kwargs)` → `bytes`
+#### `GraphClient.download_sync(**kwargs)` → `bytes | Path`
 
-Synchronous wrapper for [`download`](#graphclientdownload). Accepts all the same keyword arguments.
+Synchronous wrapper for [`download`](#graphclientdownload). Accepts all the same keyword arguments, including `to_path`.
 
 ```python
 data = client.download_sync(item_path="archive/data.bin")
+```
+
+---
+
+#### `GraphClient.read_excel_many_sync(paths, **kwargs)` → `pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]`
+
+Synchronous wrapper for [`read_excel_many`](#graphclientread_excel_many). Accepts all the same arguments.
+
+```python
+df, status = client.read_excel_many_sync(["a.xlsx", "b.xlsx"], on_error="warn", return_status=True)
+```
+
+---
+
+#### `GraphClient.read_csv_many_sync(paths, **kwargs)` → `pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]`
+
+Synchronous wrapper for [`read_csv_many`](#graphclientread_csv_many). Accepts all the same arguments.
+
+```python
+df = client.read_csv_many_sync(["a.csv", "b.csv"], on_error="skip")
 ```

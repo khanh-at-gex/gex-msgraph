@@ -2,7 +2,7 @@
 
 > Async Python wrapper for Microsoft Graph API. Provides clean access to M365 services (OneDrive, SharePoint, Outlook, Teams) from scripts, FastAPI, Prefect, or Jupyter notebooks.
 
-Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode`
+Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode, GraphError, AuthError, PermissionDeniedError, NotFoundError, RateLimitExhaustedError, GraphAuthenticationError, GraphSyncInLoopError`
 
 ## Setup
 
@@ -16,12 +16,12 @@ pip install "gex-msgraph @ git+ssh://git@github.com/companyg/gex-msgraph.git@v0.
 MS_DAS_U1_CLIENT_ID=...
 MS_DAS_U1_CLIENT_SECRET=...
 MS_DAS_U1_TENANT_ID=...
-MS_DAS_U1_USERNAME=service@company.com
+MS_DAS_U1_USERNAME=service@company.com   # omit BOTH username+password for app-only auth
 MS_DAS_U1_PASSWORD=...
-MS_DAS_U1_DEFAULT_DRIVE_ID=...   # optional
+MS_DAS_U1_DEFAULT_DRIVE_ID=...   # optional (required for app-only auth)
 ```
 
-Load env in code:
+Load env in code (`python-dotenv` is no longer bundled since v0.3.0 — add it to your own project, or install `gex-msgraph[dotenv]`):
 ```python
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,7 +33,8 @@ load_dotenv()
 - Use as async context manager: `async with GraphClient("das_u1") as client:`
 - Exactly one of `item_path`, `share_url`, or `item_id` must be provided per call.
 - `item_path` is always relative to the drive root, e.g. `"Reports/Q1.xlsx"` (no leading slash).
-- All HTTP errors raise `httpx.HTTPStatusError`. Wrap calls with `try/except httpx.HTTPStatusError`.
+- All Graph HTTP errors raise a `GraphError` subclass (`AuthError` 401, `PermissionDeniedError` 403, `NotFoundError` 404, `RateLimitExhaustedError` when retries run out). `GraphError` subclasses `httpx.HTTPStatusError`, so old `except httpx.HTTPStatusError` code still works.
+- App-only auth (no username/password): only drive operations work, and `default_drive_id` is required. Mail/Teams/chat methods need delegated (username+password) auth.
 
 ## GraphClient — instantiation
 
@@ -68,6 +69,9 @@ df = await client.read_parquet(item_path="data/users.parquet")
 
 # Download raw bytes
 data = await client.download(item_path="images/logo.png")
+
+# Download a large file straight to disk (streamed, not buffered)
+path = await client.download(item_path="exports/huge.parquet", to_path="huge.parquet")
 
 # Bulk read Excel (concurrent)
 df = await client.read_excel_many(["jan.xlsx", "feb.xlsx"], sheet="Sales", on_error="warn")
@@ -128,24 +132,25 @@ tree.print()
 ## File & folder management
 
 ```python
-# Upload local file
+# Upload local file (any size — files over 4 MiB are chunked automatically)
 result = await client.upload("./local/report.xlsx", "Reports/2026/report.xlsx")
 
-# Bulk upload (concurrent)
+# Bulk upload (concurrent, optionally bounded)
 results = await client.upload_many([
     ("./local/jan.xlsx", "Reports/jan.xlsx"),
     ("./local/feb.xlsx", "Reports/feb.xlsx"),
-])
+], max_concurrent=5)
 
 # Delete (moves to recycle bin)
 await client.delete_file(item_path="temp/scratch.xlsx")
 
-# Copy file
-await client.copy_file("Reports/Q1.xlsx", "Archive", new_name="Q1_backup.xlsx")
+# Copy file (keyword-only since v0.3.0; source accepts item_path | share_url | item_id)
+await client.copy_file(item_path="Reports/Q1.xlsx", dest_folder_path="Archive", new_name="Q1_backup.xlsx")
+item = await client.copy_file(item_path="Reports/Q1.xlsx", dest_folder_path="Archive", wait=True)  # blocks until done, returns FileItem
 
-# Move and/or rename
-await client.move_file("Drafts/v2.xlsx", dest_folder_path="Published", new_name="final.xlsx")
-await client.move_file("Reports/old.xlsx", new_name="new.xlsx")  # rename only
+# Move and/or rename (keyword-only since v0.3.0)
+await client.move_file(item_path="Drafts/v2.xlsx", dest_folder_path="Published", new_name="final.xlsx")
+await client.move_file(item_path="Reports/old.xlsx", new_name="new.xlsx")  # rename only
 
 # Create folder
 folder = await client.create_folder("Reports/2026/Q1")
@@ -209,26 +214,31 @@ client = GraphClient("das_u1")
 df   = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 df   = client.read_csv_sync(item_path="data.csv")
 data = client.download_sync(item_path="image.png")
+client.close_sync()  # when done
 ```
 
-> In Jupyter, use `await` directly — do NOT use `_sync` wrappers inside a notebook.
+> In Jupyter, use `await` directly — `_sync` wrappers raise `GraphSyncInLoopError` inside a running event loop.
 
 ## FileItem fields
 
-`name`, `path`, `id`, `size` (bytes), `modified` (datetime UTC), `is_folder` (bool)
+`name`, `path`, `id`, `size` (bytes), `modified` (datetime UTC), `is_folder` (bool), `webUrl` (`str | None` — real SharePoint/OneDrive item URL, safe for Office Online embed iframes; `get_share_link`'s `/:x:/` links are NOT safe for embedding)
 
 ## Error handling
 
 ```python
-import httpx
+from gex_msgraph import GraphError, NotFoundError, PermissionDeniedError
 
 try:
     df = await client.read_excel(item_path="Reports/Q1.xlsx")
-except httpx.HTTPStatusError as e:
+except NotFoundError:
+    print("path not found")
+except PermissionDeniedError:
+    print("no permission")
+except GraphError as e:  # anything else from Graph
     print(e.response.status_code, e.response.text)
 ```
 
-Common status codes: `403` = no permission, `404` = path not found, `429` = rate limit (auto-retried).
+`GraphError` subclasses `httpx.HTTPStatusError`, so legacy `except httpx.HTTPStatusError` still works. `429`/5xx are auto-retried; `RateLimitExhaustedError` fires only if all retries fail.
 
 ## Full API reference
 

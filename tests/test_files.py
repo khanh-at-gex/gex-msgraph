@@ -59,6 +59,7 @@ def test_parse_drive_item():
         "name": "Q1.xlsx",
         "size": 1024,
         "lastModifiedDateTime": "2026-05-01T12:00:00Z",
+        "webUrl": "https://tenant.sharepoint.com/sites/site/_layouts/15/Doc.aspx?sourcedoc=%7B123%7D",
         "parentReference": {
             "path": "/drive/root:/Reports/2026-Q1"
         }
@@ -70,7 +71,8 @@ def test_parse_drive_item():
     assert not fi.is_folder
     assert fi.path == "Reports/2026-Q1/Q1.xlsx"
     assert fi.modified == datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
-    
+    assert fi.webUrl == "https://tenant.sharepoint.com/sites/site/_layouts/15/Doc.aspx?sourcedoc=%7B123%7D"
+
     folder = {
         "id": "456",
         "name": "EmptyFolder",
@@ -79,3 +81,4 @@ def test_parse_drive_item():
     fi2 = parse_drive_item(folder, parent_path="Reports")
     assert fi2.is_folder
     assert fi2.path == "Reports/EmptyFolder"
+    assert fi2.webUrl is None

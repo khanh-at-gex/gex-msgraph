@@ -7,9 +7,13 @@ gex-msgraph
 │   │               username, password, default_drive_id,
 │   │               max_concurrent, request_timeout)
 │   ├── Credentials  MS_<ACCOUNT>_CLIENT_ID / SECRET / TENANT_ID
-│   │                MS_<ACCOUNT>_USERNAME / PASSWORD
+│   │                MS_<ACCOUNT>_USERNAME / PASSWORD  (optional pair)
 │   ├── Identifiers  item_path | share_url | item_id  (exactly one)
-│   └── Auth         MSAL ROPC flow · auto-retry 429 / 5xx
+│   ├── Auth         delegated ROPC (username+password) or
+│   │                app-only client credentials (omit both) · auto-retry 429 / 5xx
+│   └── Errors       GraphError(httpx.HTTPStatusError) → AuthError · PermissionDeniedError
+│                    · NotFoundError · RateLimitExhaustedError
+│                    GraphAuthenticationError · GraphSyncInLoopError
 │
 ├── File Operations
 │   ├── Reading
@@ -31,22 +35,26 @@ gex-msgraph
 │   │   └── get_folder_tree(folder_path)      → TreeNode  (.print())
 │   │
 │   ├── Management
-│   │   ├── download(*, item_path|share_url|item_id)    → bytes
-│   │   ├── upload(local_path, remote_path)             → dict
-│   │   ├── upload_many([(local, remote), ...], *, on_error, return_status)
+│   │   ├── download(*, item_path|share_url|item_id, to_path=None) → bytes | Path
+│   │   ├── upload(local_path, remote_path)             → dict  (>4 MiB chunked)
+│   │   ├── upload_many([(local, remote), ...], *, on_error,
+│   │   │               max_concurrent, return_status)
 │   │   ├── delete_file(*, item_path|share_url|item_id)
-│   │   ├── copy_file(source_path, dest_folder_path, new_name)
-│   │   ├── move_file(source_path, dest_folder_path, new_name)  → FileItem
+│   │   ├── copy_file(*, item_path|share_url|item_id, dest_folder_path,
+│   │   │             new_name, wait, wait_timeout)     → FileItem | None
+│   │   ├── move_file(*, item_path|share_url|item_id,
+│   │   │             dest_folder_path, new_name)       → FileItem
 │   │   ├── create_folder(folder_path)                  → FileItem
 │   │   └── get_share_link(*, item_path|share_url|item_id,
 │   │                       link_type, scope)           → str (webUrl)
 │   │
-│   └── Sync Wrappers  (asyncio.run — scripts / no event loop)
+│   └── Sync Wrappers  (background loop — scripts / no event loop)
 │       ├── read_excel_sync(**kwargs)
 │       ├── read_csv_sync(**kwargs)
 │       ├── download_sync(**kwargs)
 │       ├── read_excel_many_sync(paths, **kwargs)
-│       └── read_csv_many_sync(paths, **kwargs)
+│       ├── read_csv_many_sync(paths, **kwargs)
+│       └── close_sync()
 │
 ├── Communication
 │   ├── Email
@@ -61,6 +69,6 @@ gex-msgraph
 │       └── send_chat_message(chat_id, text)
 │
 └── Public Types
-    ├── FileItem    name · path · id · size · modified · is_folder
+    ├── FileItem    name · path · id · size · modified · is_folder · webUrl
     └── TreeNode    item: FileItem | None · children: list[TreeNode] · print()
 ```

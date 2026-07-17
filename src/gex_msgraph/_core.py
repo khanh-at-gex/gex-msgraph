@@ -5,9 +5,10 @@ import base64
 import logging
 import mimetypes
 import os
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -16,6 +17,12 @@ if TYPE_CHECKING:
 import httpx
 import msal
 
+from gex_msgraph._exceptions import (
+    GraphAuthenticationError,
+    GraphSyncInLoopError,
+    NotFoundError,
+    raise_graph_error,
+)
 from gex_msgraph._files import FileItem, build_resolution_url, validate_identifier
 
 logger = logging.getLogger("gex_msgraph")
@@ -28,6 +35,34 @@ _DEFAULT_MAX_CONCURRENT = 10
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_EXCEL_ENGINE = "calamine"
 _BACKOFF_CAP = 30.0
+# Graph's simple PUT :/content caps out around 4 MiB; larger files must go
+# through an upload session. Chunks must be multiples of 320 KiB.
+_UPLOAD_SESSION_THRESHOLD = 4 * 1024 * 1024
+_UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024  # 32 x 320 KiB
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+async def _gather_with_status(
+    items: list[_T],
+    worker: Callable[[_T], Awaitable[tuple[_R | None, str, str]]],
+    *,
+    max_concurrent: int | None = None,
+) -> list[tuple[_T, _R | None, str, str]]:
+    """Run `worker` over `items` concurrently (optionally semaphore-bounded),
+    collecting each item's `(result, status, message)` outcome."""
+    sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
+
+    async def _bounded(item: _T) -> tuple[_T, _R | None, str, str]:
+        if sem:
+            async with sem:
+                result, status, msg = await worker(item)
+        else:
+            result, status, msg = await worker(item)
+        return item, result, status, msg
+
+    return await asyncio.gather(*[_bounded(item) for item in items])
 
 
 def _load_account_env(name: str) -> dict[str, str]:
@@ -38,7 +73,6 @@ def _load_account_env(name: str) -> dict[str, str]:
     res = {k.lower(): v for k in keys if (v := os.environ.get(prefix + k))}
 
     defaults = {
-        "DEFAULT_SITE_ID": "",
         "DEFAULT_DRIVE_ID": "",
         "MAX_CONCURRENT": str(_DEFAULT_MAX_CONCURRENT),
         "REQUEST_TIMEOUT": str(_DEFAULT_TIMEOUT),
@@ -65,11 +99,13 @@ class _TokenProvider:
         client_id: str,
         client_secret: str,
         tenant_id: str,
-        username: str,
-        password: str,
+        username: str | None = None,
+        password: str | None = None,
     ) -> None:
         self._username = username
         self._password = password
+        # Both absent -> app-only (client credentials); both present -> ROPC.
+        self._app_only = username is None and password is None
         self._app = msal.ConfidentialClientApplication(
             client_id=client_id,
             client_credential=client_secret,
@@ -78,22 +114,29 @@ class _TokenProvider:
 
     def get_token(self) -> str:
         """Returns access token. Synchronous (MSAL is sync). Cached automatically."""
-        accounts = self._app.get_accounts(username=self._username)
-        if accounts:
-            result = self._app.acquire_token_silent(_DEFAULT_SCOPE, account=accounts[0])
+        if self._app_only:
+            result = self._app.acquire_token_for_client(scopes=_DEFAULT_SCOPE)
             if result and "access_token" in result:
                 return str(result["access_token"])
+        else:
+            accounts = self._app.get_accounts(username=self._username)
+            if accounts:
+                result = self._app.acquire_token_silent(
+                    _DEFAULT_SCOPE, account=accounts[0]
+                )
+                if result and "access_token" in result:
+                    return str(result["access_token"])
 
-        result = self._app.acquire_token_by_username_password(
-            username=self._username,
-            password=self._password,
-            scopes=_DEFAULT_SCOPE,
-        )
-        if "access_token" in result:
-            return str(result["access_token"])
+            result = self._app.acquire_token_by_username_password(
+                username=self._username,
+                password=self._password,
+                scopes=_DEFAULT_SCOPE,
+            )
+            if "access_token" in result:
+                return str(result["access_token"])
 
         err = result.get("error_description") or result.get("error") or "Unknown error"
-        raise RuntimeError(f"Token acquisition failed: {err}")
+        raise GraphAuthenticationError(f"Token acquisition failed: {err}")
 
 
 class GraphClient:
@@ -106,7 +149,6 @@ class GraphClient:
         tenant_id: str | None = None,
         username: str | None = None,
         password: str | None = None,
-        default_site_id: str | None = None,
         default_drive_id: str | None = None,
         max_concurrent: int | None = None,
         request_timeout: float | None = None,
@@ -119,8 +161,6 @@ class GraphClient:
             ("client_id", client_id),
             ("client_secret", client_secret),
             ("tenant_id", tenant_id),
-            ("username", username),
-            ("password", password),
         ]:
             resolved = val or cfg.get(key)
             if not resolved:
@@ -129,11 +169,34 @@ class GraphClient:
                 )
             creds[key] = resolved
 
-        self._provider = _TokenProvider(**creds)
+        # username/password select the auth flow: both present -> delegated
+        # (ROPC), both absent -> app-only (client credentials). One without
+        # the other is a configuration error.
+        resolved_username = username or cfg.get("username")
+        resolved_password = password or cfg.get("password")
+        if (resolved_username is None) != (resolved_password is None):
+            raise ValueError(
+                "Provide both username and password for delegated (ROPC) auth, "
+                "or neither for app-only (client credentials) auth."
+            )
+
         self._default_drive_id = (
             default_drive_id
             if default_drive_id is not None
             else cfg.get("default_drive_id", "")
+        )
+
+        # App-only tokens have no signed-in user, so the /me/drive default
+        # cannot resolve — fail at construction, not on the first request.
+        if resolved_username is None and not self._default_drive_id:
+            raise ValueError(
+                "App-only auth (no username/password) requires default_drive_id "
+                f"(or MS_{self.account.upper()}_DEFAULT_DRIVE_ID), because /me/* "
+                "endpoints have no meaning without a signed-in user."
+            )
+
+        self._provider = _TokenProvider(
+            **creds, username=resolved_username, password=resolved_password
         )
 
         timeout = (
@@ -149,10 +212,66 @@ class GraphClient:
 
         self._client = httpx.AsyncClient(timeout=timeout)
         self._semaphore = asyncio.Semaphore(concurrent)
+        # Lazily-started background loop that hosts all *_sync work, so the
+        # httpx client/semaphore stay bound to one loop across sync calls.
+        self._sync_loop: asyncio.AbstractEventLoop | None = None
+        self._sync_thread: threading.Thread | None = None
+
+    def _run_sync(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            coro.close()
+            raise GraphSyncInLoopError(
+                "GraphClient *_sync methods cannot be called from within a "
+                "running event loop (e.g. Jupyter, an async web framework). "
+                "Use the async method directly instead, e.g. "
+                "`await client.read_excel(...)`."
+            )
+
+        if self._sync_loop is None:
+            self._sync_loop = asyncio.new_event_loop()
+            self._sync_thread = threading.Thread(
+                target=self._sync_loop.run_forever, daemon=True
+            )
+            self._sync_thread.start()
+
+        future = asyncio.run_coroutine_threadsafe(coro, self._sync_loop)
+        return future.result()
+
+    def _shutdown_sync_loop(self) -> None:
+        if self._sync_loop is not None:
+            self._sync_loop.call_soon_threadsafe(self._sync_loop.stop)
+            if self._sync_thread is not None:
+                self._sync_thread.join(timeout=5)
+            self._sync_loop.close()
+            self._sync_loop = None
+            self._sync_thread = None
 
     async def close(self) -> None:
         """Close the underlying httpx client. Safe to call multiple times."""
+        if self._sync_loop is not None:
+            # The httpx client is bound to the background sync loop — closing
+            # it from this loop would be a cross-loop call. Delegate to
+            # close_sync on a worker thread instead.
+            await asyncio.to_thread(self.close_sync)
+            return
         await self._client.aclose()
+
+    def close_sync(self) -> None:
+        """Close from synchronous code — companion to the *_sync methods."""
+        if self._sync_loop is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.aclose(), self._sync_loop
+            )
+            future.result(timeout=5)
+            self._shutdown_sync_loop()
+        else:
+            # Client was never used on the sync loop; a throwaway loop is
+            # fine for a plain aclose.
+            asyncio.run(self._client.aclose())
 
     async def __aenter__(self) -> "GraphClient":
         return self
@@ -209,8 +328,7 @@ class GraphClient:
             if status == 429 or status >= 500:
                 if attempt >= _DEFAULT_MAX_RETRIES:
                     logger.error("Graph request failed after %s attempts", attempt)
-                    response.raise_for_status()
-                    raise AssertionError("unreachable")
+                    raise_graph_error(response, retries_exhausted=True)
 
                 backoff = _compute_backoff(attempt, response.headers.get("Retry-After"))
                 logger.info(
@@ -225,8 +343,7 @@ class GraphClient:
                 continue
 
             logger.error("Graph request failed %s: %s", status, response.text)
-            response.raise_for_status()
-            raise AssertionError("unreachable")
+            raise_graph_error(response)
 
     async def _get_download_url(
         self,
@@ -246,11 +363,64 @@ class GraphClient:
         return str(download_url)
 
     async def _stream_to_bytes(self, url: str) -> bytes:
-        async with self._semaphore:
-            logger.debug("Streaming %s", url)
-            resp = await self._client.get(url)
-            resp.raise_for_status()
-            return await resp.aread()
+        # No Bearer header here (pre-authenticated Graph downloadUrl), so this
+        # bypasses _request() and keeps its own 429/5xx retry loop in sync
+        # with _compute_backoff's behavior instead.
+        attempt = 0
+        while True:
+            async with self._semaphore:
+                logger.debug("Streaming %s", url)
+                resp = await self._client.get(url)
+
+            status = resp.status_code
+            if status < 400:
+                return await resp.aread()
+
+            if status == 429 or status >= 500:
+                if attempt >= _DEFAULT_MAX_RETRIES:
+                    raise_graph_error(resp, retries_exhausted=True)
+
+                backoff = _compute_backoff(attempt, resp.headers.get("Retry-After"))
+                logger.info(
+                    "Retrying download in %.1fs (attempt %s)", backoff, attempt + 1
+                )
+                await asyncio.sleep(backoff)
+                attempt += 1
+                continue
+
+            raise_graph_error(resp)
+
+    async def _stream_to_path(self, url: str, dest: Path) -> Path:
+        # Same no-Bearer/retry contract as _stream_to_bytes, but writes the
+        # body to disk in chunks instead of buffering it in memory. Retries
+        # only whole requests (status known before the body is consumed);
+        # mid-stream resume is out of scope.
+        attempt = 0
+        while True:
+            async with self._semaphore:
+                logger.debug("Streaming %s to %s", url, dest)
+                async with self._client.stream("GET", url) as resp:
+                    status = resp.status_code
+                    if status < 400:
+                        with open(dest, "wb") as f:
+                            async for chunk in resp.aiter_bytes():
+                                f.write(chunk)
+                        return dest
+                    await resp.aread()
+
+            if status == 429 or status >= 500:
+                if attempt >= _DEFAULT_MAX_RETRIES:
+                    raise_graph_error(resp, retries_exhausted=True)
+
+                backoff = _compute_backoff(attempt, resp.headers.get("Retry-After"))
+                logger.info(
+                    "Retrying download in %.1fs (attempt %s)", backoff, attempt + 1
+                )
+                await asyncio.sleep(backoff)
+                attempt += 1
+                continue
+
+            raise_graph_error(resp)
 
     async def _iter_paginated(self, url: str) -> AsyncIterator[dict[str, Any]]:
         while url:
@@ -315,17 +485,44 @@ class GraphClient:
         )
         return pd.read_parquet(io.BytesIO(data), **kwargs)
 
+    @overload
     async def download(
         self,
         *,
         item_path: str | None = None,
         share_url: str | None = None,
         item_id: str | None = None,
-    ) -> bytes:
-        """Return raw file bytes. Use for non-pandas parsing."""
+        to_path: None = None,
+    ) -> bytes: ...
+
+    @overload
+    async def download(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+        to_path: str | os.PathLike[str],
+    ) -> Path: ...
+
+    async def download(
+        self,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
+        to_path: str | os.PathLike[str] | None = None,
+    ) -> bytes | Path:
+        """Return raw file bytes, or stream to disk when `to_path` is given.
+
+        With `to_path` set, the body is written in chunks (never fully
+        buffered in memory) and the written Path is returned.
+        """
         url = await self._get_download_url(
             item_path=item_path, share_url=share_url, item_id=item_id
         )
+        if to_path is not None:
+            return await self._stream_to_path(url, Path(to_path))
         return await self._stream_to_bytes(url)
 
     async def read_excel_many(
@@ -384,20 +581,9 @@ class GraphClient:
                 df["_source"] = path
             return df, "success", ""
 
-        sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
-
-        async def _bounded_process(
-            path: str,
-        ) -> tuple[str, pd.DataFrame | None, str, str]:
-            if sem:
-                async with sem:
-                    df, status, msg = await _process_one(path)
-            else:
-                df, status, msg = await _process_one(path)
-            return path, df, status, msg
-
-        tasks = [_bounded_process(p) for p in paths]
-        results = await asyncio.gather(*tasks)
+        results = await _gather_with_status(
+            paths, _process_one, max_concurrent=max_concurrent
+        )
 
         valid_dfs = []
         status_records = []
@@ -450,20 +636,9 @@ class GraphClient:
                 df["_source"] = path
             return df, "success", ""
 
-        sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
-
-        async def _bounded_process(
-            path: str,
-        ) -> tuple[str, pd.DataFrame | None, str, str]:
-            if sem:
-                async with sem:
-                    df, status, msg = await _process_one(path)
-            else:
-                df, status, msg = await _process_one(path)
-            return path, df, status, msg
-
-        tasks = [_bounded_process(p) for p in paths]
-        results = await asyncio.gather(*tasks)
+        results = await _gather_with_status(
+            paths, _process_one, max_concurrent=max_concurrent
+        )
 
         valid_dfs = []
         status_records = []
@@ -572,32 +747,38 @@ class GraphClient:
         )
         await self._request("DELETE", url)
 
+    def _dest_folder_ref(self, dest_folder_path: str) -> dict[str, str]:
+        """Build the parentReference payload for a destination folder path."""
+        drive_root = self._drive_root()
+        dest_clean = dest_folder_path.lstrip("/")
+        return {
+            "path": (
+                f"{drive_root}/root:/{dest_clean}"
+                if dest_clean
+                else f"{drive_root}/root"
+            )
+        }
+
     async def move_file(
         self,
-        source_path: str,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
         dest_folder_path: str | None = None,
         new_name: str | None = None,
     ) -> FileItem:
-        """Move or rename a file using paths."""
+        """Move or rename a file. Source accepts any identifier kind;
+        the destination is always a folder path in the current drive."""
         from gex_msgraph._files import parse_drive_item
-        import urllib.parse
 
-        drive_root = self._drive_root()
-        source_clean = source_path.lstrip("/")
-
-        encoded_source = urllib.parse.quote(source_clean)
-        url = f"{drive_root}/root:/{encoded_source}"
+        _, url = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
 
         payload: dict[str, Any] = {}
         if dest_folder_path is not None:
-            dest_clean = dest_folder_path.lstrip("/")
-            payload["parentReference"] = {
-                "path": (
-                    f"{drive_root}/root:/{dest_clean}"
-                    if dest_clean
-                    else f"{drive_root}/root"
-                )
-            }
+            payload["parentReference"] = self._dest_folder_ref(dest_folder_path)
         if new_name is not None:
             payload["name"] = new_name
 
@@ -634,32 +815,71 @@ class GraphClient:
 
     async def copy_file(
         self,
-        source_path: str,
+        *,
+        item_path: str | None = None,
+        share_url: str | None = None,
+        item_id: str | None = None,
         dest_folder_path: str,
         new_name: str | None = None,
-    ) -> None:
-        """Copy a file to a new location. Graph executes the copy asynchronously."""
-        import urllib.parse
+        wait: bool = False,
+        wait_timeout: float = 60.0,
+    ) -> FileItem | None:
+        """Copy a file to a new location. Graph executes the copy asynchronously.
 
-        drive_root = self._drive_root()
-        source_clean = source_path.lstrip("/")
-        dest_clean = dest_folder_path.lstrip("/")
-        encoded_source = urllib.parse.quote(source_clean)
-        url = f"{drive_root}/root:/{encoded_source}:/copy"
+        With `wait=False` (default) returns None immediately. With `wait=True`,
+        polls Graph's copy-job monitor URL until completion (bounded by
+        `wait_timeout` seconds) and returns the new item's FileItem.
+        """
+        from gex_msgraph._exceptions import GraphError
+
+        kind, base = self._resolve_item_url(
+            item_path=item_path, share_url=share_url, item_id=item_id
+        )
+        suffix = ":/copy" if kind == "path" else "/copy"
 
         payload: dict[str, Any] = {
-            "parentReference": {
-                "path": (
-                    f"{drive_root}/root:/{dest_clean}"
-                    if dest_clean
-                    else f"{drive_root}/root"
-                )
-            }
+            "parentReference": self._dest_folder_ref(dest_folder_path)
         }
         if new_name is not None:
             payload["name"] = new_name
 
-        await self._request("POST", url, json=payload)
+        resp = await self._request("POST", base + suffix, json=payload)
+        if not wait:
+            return None
+
+        monitor_url = resp.headers.get("Location")
+        if not monitor_url:
+            raise RuntimeError("Graph did not return a monitor URL for the copy job")
+
+        # The monitor URL is pre-authenticated (like downloadUrl): poll it
+        # directly, without a Bearer header. Transient 429/5xx on the monitor
+        # count against wait_timeout rather than aborting the wait; 4xx aborts.
+        poll_interval = 1.0
+        for _ in range(max(1, int(wait_timeout / poll_interval))):
+            poll = await self._client.get(monitor_url)
+            status_code = poll.status_code
+            if status_code >= 400:
+                if status_code == 429 or status_code >= 500:
+                    logger.info(
+                        "Copy monitor returned %s; retrying poll", status_code
+                    )
+                    await asyncio.sleep(poll_interval)
+                    continue
+                raise_graph_error(poll)
+            data = poll.json()
+            job_status = data.get("status")
+            if job_status == "completed":
+                return await self.get_metadata(item_id=str(data["resourceId"]))
+            if job_status == "failed":
+                reason = data.get("error", {}).get("message", "unknown error")
+                raise GraphError(
+                    f"Copy job failed: {reason}",
+                    request=poll.request,
+                    response=poll,
+                )
+            await asyncio.sleep(poll_interval)
+
+        raise TimeoutError(f"Copy job did not complete within {wait_timeout}s")
 
     async def exists(
         self,
@@ -674,10 +894,8 @@ class GraphClient:
                 item_path=item_path, share_url=share_url, item_id=item_id
             )
             return True
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                return False
-            raise
+        except NotFoundError:
+            return False
 
     async def list_excel_sheets(
         self,
@@ -727,11 +945,16 @@ class GraphClient:
 
         async def _build_tree(path: str, node: TreeNode) -> None:
             children_items = await self.list_files(path)
+            subfolders: list[tuple[str, TreeNode]] = []
             for child in children_items:
                 child_node = TreeNode(item=child, children=[])
                 node.children.append(child_node)
                 if child.is_folder:
-                    await _build_tree(child.path, child_node)
+                    subfolders.append((child.path, child_node))
+
+            tasks = [_build_tree(sub_path, sub_node) for sub_path, sub_node in subfolders]
+            if tasks:
+                await asyncio.gather(*tasks)
 
         await _build_tree(folder_path, root_node)
         return root_node
@@ -746,19 +969,27 @@ class GraphClient:
         import urllib.parse
         from gex_msgraph._files import parse_drive_item
 
+        if limit <= 0:
+            return []
+
         encoded_query = urllib.parse.quote(query)
         url = f"{self._drive_root()}/root/search(q='{encoded_query}')?$top={limit}"
         results: list[FileItem] = []
         async for item in self._iter_paginated(url):
             results.append(parse_drive_item(item))
-        return results
+            if len(results) >= limit:
+                break
+        return results[:limit]
 
     async def upload(
         self, local_path: str | os.PathLike[str], remote_path: str
     ) -> dict[str, Any]:
-        """Upload a local file to remote_path. Returns the Graph driveItem dict."""
+        """Upload a local file to remote_path. Returns the Graph driveItem dict.
+
+        Files over ~4 MiB are transparently uploaded via a Graph upload
+        session in chunks (simple PUT :/content is capped by Graph).
+        """
         import urllib.parse
-        from pathlib import Path
 
         local_p = Path(local_path)
         if not local_p.is_file():
@@ -767,6 +998,9 @@ class GraphClient:
         drive_root = self._drive_root()
         clean_remote = remote_path.lstrip("/")
         encoded_path = urllib.parse.quote(clean_remote)
+
+        if local_p.stat().st_size > _UPLOAD_SESSION_THRESHOLD:
+            return await self._upload_via_session(local_p, encoded_path)
 
         url = f"{drive_root}/root:/{encoded_path}:/content"
 
@@ -781,19 +1015,83 @@ class GraphClient:
         )
         return cast(dict[str, Any], resp.json())
 
+    async def _upload_via_session(
+        self, local_p: Path, encoded_remote: str
+    ) -> dict[str, Any]:
+        """Chunked upload for files over the simple-PUT size cap."""
+        url = f"{self._drive_root()}/root:/{encoded_remote}:/createUploadSession"
+        payload = {"item": {"@microsoft.graph.conflictBehavior": "replace"}}
+        resp = await self._request("POST", url, json=payload)
+        upload_url = str(resp.json()["uploadUrl"])
+
+        total = local_p.stat().st_size
+        result: dict[str, Any] | None = None
+        with open(local_p, "rb") as f:
+            start = 0
+            while start < total:
+                chunk = f.read(_UPLOAD_CHUNK_SIZE)
+                end = start + len(chunk) - 1
+                headers = {
+                    "Content-Range": f"bytes {start}-{end}/{total}",
+                    "Content-Length": str(len(chunk)),
+                }
+                chunk_resp = await self._put_chunk_with_retry(
+                    upload_url, chunk, headers
+                )
+                if chunk_resp.status_code in (200, 201):
+                    result = cast(dict[str, Any], chunk_resp.json())
+                start = end + 1
+
+        if result is None:
+            raise RuntimeError(
+                f"Upload session for {local_p.name} ended without a driveItem"
+            )
+        return result
+
+    async def _put_chunk_with_retry(
+        self, url: str, chunk: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        # Upload-session URLs are pre-authenticated (no Bearer header), so
+        # like _stream_to_bytes this can't go through _request(); it keeps
+        # the same 429/5xx retry contract.
+        attempt = 0
+        while True:
+            async with self._semaphore:
+                resp = await self._client.put(url, content=chunk, headers=headers)
+
+            status = resp.status_code
+            if status < 400:
+                return resp
+
+            if status == 429 or status >= 500:
+                if attempt >= _DEFAULT_MAX_RETRIES:
+                    raise_graph_error(resp, retries_exhausted=True)
+
+                backoff = _compute_backoff(attempt, resp.headers.get("Retry-After"))
+                logger.info(
+                    "Retrying upload chunk in %.1fs (attempt %s)", backoff, attempt + 1
+                )
+                await asyncio.sleep(backoff)
+                attempt += 1
+                continue
+
+            raise_graph_error(resp)
+
     async def upload_many(
         self,
         items: list[tuple[str | os.PathLike, str]],
         *,
         on_error: Literal["raise", "skip", "warn"] = "raise",
+        max_concurrent: int | None = None,
         return_status: bool = False,
     ) -> "list[dict] | tuple[list[dict], pd.DataFrame]":
         """Upload multiple local files concurrently."""
         import pandas as pd
 
         async def _upload_one(
-            local: str | os.PathLike, remote: str
+            pair: tuple[str | os.PathLike, str]
         ) -> tuple[dict[str, Any] | None, str, str]:
+            local, remote = pair
             try:
                 result = await self.upload(local, remote)
                 return result, "success", ""
@@ -804,13 +1102,13 @@ class GraphClient:
                     logger.warning("Failed to upload %s: %s", remote, e)
                 return None, "error", str(e)
 
-        raw_results = await asyncio.gather(
-            *[_upload_one(local, remote) for local, remote in items]
+        raw_results = await _gather_with_status(
+            items, _upload_one, max_concurrent=max_concurrent
         )
 
         results: list[dict[str, Any]] = []
         status_records = []
-        for (_, remote), (result, status, msg) in zip(items, raw_results):
+        for (_, remote), result, status, msg in raw_results:
             if result is not None:
                 results.append(result)
             status_records.append({"path": str(remote), "status": status, "error": msg})
@@ -840,7 +1138,7 @@ class GraphClient:
             if isinstance(item, tuple):
                 name, data = item
             elif isinstance(item, dict):
-                data = await self.download(**item)  # type: ignore[arg-type]
+                data = cast(bytes, await self.download(**item))  # type: ignore[arg-type]
                 if "item_path" in item:
                     name = item["item_path"].split("/")[-1]
                 else:
@@ -936,20 +1234,20 @@ class GraphClient:
         await self._request("POST", f"/chats/{chat_id}/messages", json=payload)
 
     def read_excel_sync(self, **kw: Any) -> "pd.DataFrame":
-        return asyncio.run(self.read_excel(**kw))
+        return self._run_sync(self.read_excel(**kw))
 
     def read_csv_sync(self, **kw: Any) -> "pd.DataFrame":
-        return asyncio.run(self.read_csv(**kw))
+        return self._run_sync(self.read_csv(**kw))
 
-    def download_sync(self, **kw: Any) -> bytes:
-        return asyncio.run(self.download(**kw))
+    def download_sync(self, **kw: Any) -> "bytes | Path":
+        return cast("bytes | Path", self._run_sync(self.download(**kw)))
 
     def read_excel_many_sync(
         self, paths: list[str], **kw: Any
     ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
-        return asyncio.run(self.read_excel_many(paths, **kw))
+        return self._run_sync(self.read_excel_many(paths, **kw))
 
     def read_csv_many_sync(
         self, paths: list[str], **kw: Any
     ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
-        return asyncio.run(self.read_csv_many(paths, **kw))
+        return self._run_sync(self.read_csv_many(paths, **kw))

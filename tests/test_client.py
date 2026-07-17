@@ -13,6 +13,69 @@ async def test_init_missing_env(env_vars, monkeypatch):
         GraphClient("das_u1")
 
 
+async def test_init_username_without_password_raises(env_vars, monkeypatch):
+    monkeypatch.delenv("MS_DAS_U1_PASSWORD")
+    with pytest.raises(ValueError, match="both username and password"):
+        GraphClient("das_u1")
+
+
+async def test_init_app_only_when_username_and_password_absent(env_vars, monkeypatch):
+    monkeypatch.delenv("MS_DAS_U1_USERNAME")
+    monkeypatch.delenv("MS_DAS_U1_PASSWORD")
+    monkeypatch.setenv("MS_DAS_U1_DEFAULT_DRIVE_ID", "b!abc")
+
+    captured = {}
+
+    class FakeApp:
+        def acquire_token_for_client(self, scopes=None):
+            captured["called"] = True
+            return {"access_token": "app-only-token"}
+
+    monkeypatch.setattr(
+        "gex_msgraph._core.msal.ConfidentialClientApplication",
+        lambda *a, **kw: FakeApp(),
+    )
+    client = GraphClient("das_u1")
+    assert client._provider.get_token() == "app-only-token"
+    assert captured["called"]
+
+
+async def test_init_app_only_requires_default_drive_id(env_vars, monkeypatch):
+    monkeypatch.delenv("MS_DAS_U1_USERNAME")
+    monkeypatch.delenv("MS_DAS_U1_PASSWORD")
+    with pytest.raises(ValueError, match="default_drive_id"):
+        GraphClient("das_u1")
+
+
+async def test_init_ropc_uses_username_password_flow(env_vars, monkeypatch):
+    captured = {}
+
+    class FakeApp:
+        def get_accounts(self, username=None):
+            return []
+
+        def acquire_token_by_username_password(self, username, password, scopes):
+            captured["username"] = username
+            return {"access_token": "ropc-token"}
+
+        def acquire_token_for_client(self, scopes=None):
+            raise AssertionError("app-only flow must not be used when creds present")
+
+    monkeypatch.setattr(
+        "gex_msgraph._core.msal.ConfidentialClientApplication",
+        lambda *a, **kw: FakeApp(),
+    )
+    client = GraphClient("das_u1")
+    assert client._provider.get_token() == "ropc-token"
+    assert captured["username"] == "fake_user"
+
+
+async def test_init_rejects_default_site_id_kwarg(env_vars):
+    # Removed in v0.3.0 — passing it must fail loudly, not be silently dropped.
+    with pytest.raises(TypeError):
+        GraphClient("das_u1", default_site_id="site123")
+
+
 async def test_download(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
         rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
@@ -82,6 +145,47 @@ async def test_no_retry_403(env_vars, mock_token):
             with pytest.raises(httpx.HTTPStatusError):
                 await client.download(item_path="file.txt")
 
+            assert route.call_count == 1
+
+
+async def test_download_retries_transient_error_on_download_url(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://download.url"}
+            )
+        )
+        route = rm.get("https://download.url")
+        route.side_effect = [
+            httpx.Response(503),
+            httpx.Response(200, content=b"hello bytes"),
+        ]
+
+        client = GraphClient("das_u1")
+        async with client:
+            with pytest.MonkeyPatch.context() as m:
+                async def mock_sleep(x):
+                    pass
+                m.setattr(asyncio, "sleep", mock_sleep)
+                res = await client.download(item_path="file.txt")
+            assert res == b"hello bytes"
+            assert route.call_count == 2
+
+
+async def test_download_no_retry_on_404_from_download_url(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://download.url"}
+            )
+        )
+        route = rm.get("https://download.url")
+        route.mock(return_value=httpx.Response(404))
+
+        client = GraphClient("das_u1")
+        async with client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.download(item_path="file.txt")
             assert route.call_count == 1
 
 
@@ -216,10 +320,125 @@ async def test_copy_file(env_vars, mock_token):
         route = rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/src.xlsx:/copy")
         route.mock(return_value=httpx.Response(202))
         async with GraphClient("das_u1") as client:
-            await client.copy_file("src.xlsx", "Archive", new_name="src_copy.xlsx")
+            result = await client.copy_file(
+                item_path="src.xlsx",
+                dest_folder_path="Archive",
+                new_name="src_copy.xlsx",
+            )
+    assert result is None  # wait=False keeps the fire-and-forget contract
     payload = json.loads(route.calls[0].request.content)
     assert "Archive" in payload["parentReference"]["path"]
     assert payload["name"] == "src_copy.xlsx"
+
+
+async def test_copy_file_by_item_id(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.post("https://graph.microsoft.com/v1.0/me/drive/items/01ABC/copy")
+        route.mock(return_value=httpx.Response(202))
+        async with GraphClient("das_u1") as client:
+            await client.copy_file(item_id="01ABC", dest_folder_path="Archive")
+    assert route.call_count == 1
+
+
+async def test_copy_file_wait_polls_until_completed(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/src.xlsx:/copy").mock(
+            return_value=httpx.Response(
+                202, headers={"Location": "https://monitor.url/job1"}
+            )
+        )
+        monitor = rm.get("https://monitor.url/job1")
+        monitor.side_effect = [
+            httpx.Response(202, json={"status": "inProgress"}),
+            httpx.Response(
+                200, json={"status": "completed", "resourceId": "NEW123"}
+            ),
+        ]
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/items/NEW123").mock(
+            return_value=httpx.Response(
+                200, json={"id": "NEW123", "name": "src_copy.xlsx", "size": 9}
+            )
+        )
+
+        async with GraphClient("das_u1") as client:
+            with pytest.MonkeyPatch.context() as m:
+                async def mock_sleep(x):
+                    pass
+                m.setattr(asyncio, "sleep", mock_sleep)
+                item = await client.copy_file(
+                    item_path="src.xlsx", dest_folder_path="Archive", wait=True
+                )
+
+    assert item is not None and item.id == "NEW123"
+    assert monitor.call_count == 2
+
+
+async def test_copy_file_wait_survives_transient_monitor_error(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/src.xlsx:/copy").mock(
+            return_value=httpx.Response(
+                202, headers={"Location": "https://monitor.url/job3"}
+            )
+        )
+        monitor = rm.get("https://monitor.url/job3")
+        monitor.side_effect = [
+            httpx.Response(503),  # transient — must keep polling, not TimeoutError
+            httpx.Response(200, json={"status": "completed", "resourceId": "NEW9"}),
+        ]
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/items/NEW9").mock(
+            return_value=httpx.Response(200, json={"id": "NEW9", "name": "c.xlsx"})
+        )
+
+        async with GraphClient("das_u1") as client:
+            with pytest.MonkeyPatch.context() as m:
+                async def mock_sleep(x):
+                    pass
+                m.setattr(asyncio, "sleep", mock_sleep)
+                item = await client.copy_file(
+                    item_path="src.xlsx", dest_folder_path="Archive", wait=True
+                )
+    assert item is not None and item.id == "NEW9"
+    assert monitor.call_count == 2
+
+
+async def test_copy_file_wait_raises_on_monitor_4xx(env_vars, mock_token):
+    from gex_msgraph import NotFoundError
+
+    with respx.mock(assert_all_called=False) as rm:
+        rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/src.xlsx:/copy").mock(
+            return_value=httpx.Response(
+                202, headers={"Location": "https://monitor.url/job4"}
+            )
+        )
+        rm.get("https://monitor.url/job4").mock(return_value=httpx.Response(404))
+
+        async with GraphClient("das_u1") as client:
+            with pytest.raises(NotFoundError):
+                await client.copy_file(
+                    item_path="src.xlsx", dest_folder_path="Archive", wait=True
+                )
+
+
+async def test_copy_file_wait_raises_on_failed_status(env_vars, mock_token):
+    from gex_msgraph import GraphError
+
+    with respx.mock(assert_all_called=False) as rm:
+        rm.post("https://graph.microsoft.com/v1.0/me/drive/root:/src.xlsx:/copy").mock(
+            return_value=httpx.Response(
+                202, headers={"Location": "https://monitor.url/job2"}
+            )
+        )
+        rm.get("https://monitor.url/job2").mock(
+            return_value=httpx.Response(
+                200,
+                json={"status": "failed", "error": {"message": "quota exceeded"}},
+            )
+        )
+        async with GraphClient("das_u1") as client:
+            with pytest.raises(GraphError, match="quota exceeded"):
+                await client.copy_file(
+                    item_path="src.xlsx", dest_folder_path="Archive", wait=True
+                )
 
 
 async def test_exists_true(env_vars, mock_token):
@@ -258,6 +477,119 @@ async def test_upload_many(env_vars, mock_token, tmp_path):
             )
     assert len(results) == 2
     assert results[0]["name"] == "a.txt"
+
+
+async def test_upload_large_file_uses_session(env_vars, mock_token, tmp_path, monkeypatch):
+    # Shrink thresholds so a tiny file exercises the chunked path.
+    monkeypatch.setattr("gex_msgraph._core._UPLOAD_SESSION_THRESHOLD", 10)
+    monkeypatch.setattr("gex_msgraph._core._UPLOAD_CHUNK_SIZE", 64)
+
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 100)  # 100 bytes -> 2 chunks of 64 + 36
+
+    with respx.mock(assert_all_called=False) as rm:
+        rm.post(
+            "https://graph.microsoft.com/v1.0/me/drive/root:/remote/big.bin:/createUploadSession"
+        ).mock(
+            return_value=httpx.Response(200, json={"uploadUrl": "https://upload.url/s1"})
+        )
+        chunk_route = rm.put("https://upload.url/s1")
+        chunk_route.side_effect = [
+            httpx.Response(202, json={"nextExpectedRanges": ["64-99"]}),
+            httpx.Response(201, json={"id": "BIG1", "name": "big.bin", "size": 100}),
+        ]
+
+        async with GraphClient("das_u1") as client:
+            result = await client.upload(big, "remote/big.bin")
+
+    assert result["id"] == "BIG1"
+    assert chunk_route.call_count == 2
+    first, second = chunk_route.calls
+    assert first.request.headers["Content-Range"] == "bytes 0-63/100"
+    assert second.request.headers["Content-Range"] == "bytes 64-99/100"
+    # Pre-authenticated session URL must NOT get a Bearer header.
+    assert "Authorization" not in first.request.headers
+
+
+async def test_upload_small_file_still_uses_simple_put(env_vars, mock_token, tmp_path):
+    small = tmp_path / "small.txt"
+    small.write_bytes(b"tiny")
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.put(
+            "https://graph.microsoft.com/v1.0/me/drive/root:/remote/small.txt:/content"
+        )
+        route.mock(return_value=httpx.Response(201, json={"name": "small.txt"}))
+        async with GraphClient("das_u1") as client:
+            result = await client.upload(small, "remote/small.txt")
+    assert result["name"] == "small.txt"
+    assert route.call_count == 1
+
+
+async def test_download_to_path_streams_to_disk(env_vars, mock_token, tmp_path):
+    from pathlib import Path
+
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.bin").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://download.url"}
+            )
+        )
+        rm.get("https://download.url").mock(
+            return_value=httpx.Response(200, content=b"streamed content")
+        )
+
+        dest = tmp_path / "out.bin"
+        async with GraphClient("das_u1") as client:
+            returned = await client.download(item_path="file.bin", to_path=dest)
+
+    assert returned == Path(dest)
+    assert dest.read_bytes() == b"streamed content"
+
+
+async def test_download_to_path_retries_transient_error(env_vars, mock_token, tmp_path):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.bin").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://download.url"}
+            )
+        )
+        route = rm.get("https://download.url")
+        route.side_effect = [
+            httpx.Response(503),
+            httpx.Response(200, content=b"ok after retry"),
+        ]
+
+        dest = tmp_path / "out.bin"
+        async with GraphClient("das_u1") as client:
+            with pytest.MonkeyPatch.context() as m:
+                async def mock_sleep(x):
+                    pass
+                m.setattr(asyncio, "sleep", mock_sleep)
+                await client.download(item_path="file.bin", to_path=dest)
+
+    assert dest.read_bytes() == b"ok after retry"
+    assert route.call_count == 2
+
+
+async def test_upload_many_respects_max_concurrent(env_vars, mock_token):
+    concurrent = 0
+    peak = 0
+
+    async def fake_upload(local, remote):
+        nonlocal concurrent, peak
+        concurrent += 1
+        peak = max(peak, concurrent)
+        await asyncio.sleep(0.01)
+        concurrent -= 1
+        return {"name": str(remote)}
+
+    client = GraphClient("das_u1")
+    client.upload = fake_upload  # type: ignore[method-assign]
+    items = [(f"local{i}.txt", f"remote{i}.txt") for i in range(4)]
+    results = await client.upload_many(items, max_concurrent=2)
+
+    assert len(results) == 4
+    assert peak <= 2
 
 
 async def test_get_share_link(env_vars, mock_token):
@@ -330,6 +662,35 @@ async def test_search_files(env_vars, mock_token):
     assert results[0].name == "budget.xlsx"
 
 
+async def test_search_files_respects_limit_across_pages(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        page1_items = [{"name": f"file{i}.xlsx", "size": 1} for i in range(20)]
+        page2_items = [{"name": f"file{i}.xlsx", "size": 1} for i in range(20, 40)]
+
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/drive/root/search(q='x')?$top=25"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "value": page1_items,
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2",
+                },
+            )
+        )
+        route2 = rm.get("https://graph.microsoft.com/v1.0/page2")
+        route2.mock(return_value=httpx.Response(200, json={"value": page2_items}))
+
+        async with GraphClient("das_u1") as client:
+            results = await client.search_files("x", limit=25)
+
+    assert len(results) == 25
+    # Only enough of page 2 was consumed to reach the limit; the generator
+    # stopped once 25 results were collected, but the page fetch itself
+    # (which returns the whole page at once) still only happened once.
+    assert route2.call_count == 1
+
+
 def test_sync_wrappers(env_vars, mock_token):
     with respx.mock(assert_all_called=False) as rm:
         rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
@@ -342,8 +703,63 @@ def test_sync_wrappers(env_vars, mock_token):
         )
 
         client = GraphClient("das_u1")
-        res = client.download_sync(item_path="file.txt")
-        assert res == b"hello bytes"
+        try:
+            res = client.download_sync(item_path="file.txt")
+            assert res == b"hello bytes"
+        finally:
+            client.close_sync()
+
+
+def test_sync_wrapper_called_twice_reuses_loop(env_vars, mock_token):
+    # Regression: second asyncio.run() used to hit "attached to a different
+    # event loop"; the persistent background loop makes repeat calls safe.
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/file.txt").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://download.url"}
+            )
+        )
+        rm.get("https://download.url").mock(
+            return_value=httpx.Response(200, content=b"hello bytes")
+        )
+
+        client = GraphClient("das_u1")
+        try:
+            assert client.download_sync(item_path="file.txt") == b"hello bytes"
+            assert client.download_sync(item_path="file.txt") == b"hello bytes"
+        finally:
+            client.close_sync()
+
+
+async def test_async_close_after_sync_use_delegates_to_sync_loop(env_vars, mock_token):
+    # Regression: `await client.close()` after *_sync usage used to aclose the
+    # httpx client from the wrong event loop.
+    def _use_sync(client):
+        with respx.mock(assert_all_called=False) as rm:
+            rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/f.txt").mock(
+                return_value=httpx.Response(
+                    200, json={"@microsoft.graph.downloadUrl": "https://download.url"}
+                )
+            )
+            rm.get("https://download.url").mock(
+                return_value=httpx.Response(200, content=b"x")
+            )
+            assert client.download_sync(item_path="f.txt") == b"x"
+
+    client = GraphClient("das_u1")
+    await asyncio.to_thread(_use_sync, client)
+    assert client._sync_loop is not None
+    await client.close()  # must not raise; must tear down the background loop
+    assert client._sync_loop is None
+
+
+async def test_sync_wrapper_raises_inside_running_loop(env_vars, mock_token):
+    from gex_msgraph import GraphSyncInLoopError
+
+    client = GraphClient("das_u1")
+    async with client:
+        with pytest.raises(GraphSyncInLoopError, match="await client"):
+            client.download_sync(item_path="file.txt")
 
 
 async def test_get_metadata(env_vars, mock_token):
@@ -378,11 +794,41 @@ async def test_move_file(env_vars, mock_token):
 
         client = GraphClient("das_u1")
         async with client:
-            res = await client.move_file("file.txt", "dest/folder", new_name="new.txt")
+            res = await client.move_file(
+                item_path="file.txt",
+                dest_folder_path="dest/folder",
+                new_name="new.txt",
+            )
             assert res.name == "new.txt"
             payload = route.calls[0].request.read().decode()
             assert "dest/folder" in payload
             assert "new.txt" in payload
+
+
+async def test_move_file_by_item_id(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.patch("https://graph.microsoft.com/v1.0/me/drive/items/01ABC")
+        route.mock(return_value=httpx.Response(200, json={"name": "file.txt"}))
+
+        async with GraphClient("das_u1") as client:
+            res = await client.move_file(item_id="01ABC", dest_folder_path="Archive")
+    assert res.name == "file.txt"
+    payload = json.loads(route.calls[0].request.content)
+    assert "Archive" in payload["parentReference"]["path"]
+
+
+async def test_move_file_requires_dest_or_name(env_vars, mock_token):
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(ValueError, match="dest_folder_path or new_name"):
+            await client.move_file(item_path="file.txt")
+
+
+async def test_move_file_requires_exactly_one_identifier(env_vars, mock_token):
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(ValueError, match="exactly one"):
+            await client.move_file(
+                item_path="a.txt", item_id="01ABC", dest_folder_path="x"
+            )
 
 
 async def test_create_folder(env_vars, mock_token):
@@ -440,6 +886,45 @@ async def test_get_folder_tree(env_vars, mock_token):
             assert len(tree.children) == 2
             assert tree.children[0].item.name == "file.txt"
             assert tree.children[1].item.name == "sub"
+
+
+async def test_get_folder_tree_preserves_order_with_parallel_sibling_recursion(
+    env_vars, mock_token
+):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/root").mock(
+            return_value=httpx.Response(200, json={"name": "root", "folder": {}})
+        )
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/root:/children").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {"name": "subA", "folder": {}},
+                        {"name": "subB", "folder": {}},
+                    ]
+                },
+            )
+        )
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/drive/root:/root/subA:/children"
+        ).mock(
+            return_value=httpx.Response(
+                200, json={"value": [{"name": "a1.txt"}, {"name": "a2.txt"}]}
+            )
+        )
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/drive/root:/root/subB:/children"
+        ).mock(return_value=httpx.Response(200, json={"value": [{"name": "b1.txt"}]}))
+
+        client = GraphClient("das_u1")
+        async with client:
+            tree = await client.get_folder_tree("root")
+
+        assert [c.item.name for c in tree.children] == ["subA", "subB"]
+        sub_a, sub_b = tree.children
+        assert [c.item.name for c in sub_a.children] == ["a1.txt", "a2.txt"]
+        assert [c.item.name for c in sub_b.children] == ["b1.txt"]
 
 
 async def test_get_teams_messages(env_vars, mock_token):
