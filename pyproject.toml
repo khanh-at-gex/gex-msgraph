@@ -43,7 +43,7 @@ asyncio_default_fixture_loop_scope = "function"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["pandas", "msal"]
+module = ["pandas", "msal", "openpyxl"]
 ignore_missing_imports = true
 
 [tool.ruff]

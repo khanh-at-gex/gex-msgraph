@@ -24,6 +24,7 @@ from gex_msgraph._exceptions import (
     raise_graph_error,
 )
 from gex_msgraph._files import FileItem, build_resolution_url, validate_identifier
+from gex_msgraph._spreadsheetml import prepare_excel_bytes
 
 logger = logging.getLogger("gex_msgraph")
 
@@ -446,6 +447,7 @@ class GraphClient:
         data = await self.download(
             item_path=item_path, share_url=share_url, item_id=item_id
         )
+        data, sheet = prepare_excel_bytes(data, sheet)
         buf = io.BytesIO(data)
         read_excel_kwargs.setdefault("engine", _DEFAULT_EXCEL_ENGINE)
         return pd.read_excel(buf, sheet_name=sheet, **read_excel_kwargs)
@@ -551,9 +553,14 @@ class GraphClient:
         async def _process_one(path: str) -> tuple[pd.DataFrame | None, str, str]:
             try:
                 data = await self.download(item_path=path)
+                data, requested = prepare_excel_bytes(
+                    data,
+                    sheet,
+                    sanitize_sheet_name=(sheet_match != "glob"),
+                )
                 buf = io.BytesIO(data)
                 xls = pd.ExcelFile(buf, engine=engine)
-                matched = match_sheet_name(xls.sheet_names, sheet, sheet_match)
+                matched = match_sheet_name(xls.sheet_names, requested, sheet_match)
             except Exception as e:
                 if on_error == "raise":
                     raise
@@ -1079,17 +1086,17 @@ class GraphClient:
 
     async def upload_many(
         self,
-        items: list[tuple[str | os.PathLike, str]],
+        items: list[tuple[str | os.PathLike[str], str]],
         *,
         on_error: Literal["raise", "skip", "warn"] = "raise",
         max_concurrent: int | None = None,
         return_status: bool = False,
-    ) -> "list[dict] | tuple[list[dict], pd.DataFrame]":
+    ) -> "list[dict[str, Any]] | tuple[list[dict[str, Any]], pd.DataFrame]":
         """Upload multiple local files concurrently."""
         import pandas as pd
 
         async def _upload_one(
-            pair: tuple[str | os.PathLike, str]
+            pair: tuple[str | os.PathLike[str], str]
         ) -> tuple[dict[str, Any] | None, str, str]:
             local, remote = pair
             try:
@@ -1125,7 +1132,7 @@ class GraphClient:
         *,
         body_type: Literal["text", "html"] = "text",
         cc: str | list[str] | None = None,
-        attachments: list[str | os.PathLike | tuple[str, bytes] | dict[str, str]] | None = None,
+        attachments: list[str | os.PathLike[str] | tuple[str, bytes] | dict[str, str]] | None = None,
     ) -> None:
         """Send an email from the account's mailbox."""
 
@@ -1134,15 +1141,15 @@ class GraphClient:
                 addrs = [addrs]
             return [{"emailAddress": {"address": a}} for a in addrs]
 
-        async def _make_attachment(item: str | os.PathLike | tuple[str, bytes] | dict[str, str]) -> dict[str, Any]:
+        async def _make_attachment(item: str | os.PathLike[str] | tuple[str, bytes] | dict[str, str]) -> dict[str, Any]:
             if isinstance(item, tuple):
                 name, data = item
             elif isinstance(item, dict):
-                data = cast(bytes, await self.download(**item))  # type: ignore[arg-type]
+                data = cast(bytes, await self.download(**item))
                 if "item_path" in item:
                     name = item["item_path"].split("/")[-1]
                 else:
-                    meta = await self.get_metadata(**item)  # type: ignore[arg-type]
+                    meta = await self.get_metadata(**item)
                     name = meta.name
             else:
                 p = Path(item)

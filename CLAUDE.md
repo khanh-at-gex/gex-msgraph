@@ -22,11 +22,24 @@ mypy src
 
 ```
 src/gex_msgraph/
-├── _core.py        # GraphClient + _TokenProvider + retry logic
-├── _files.py       # FileItem, TreeNode, URL resolution, sheet matching
-├── _exceptions.py  # GraphError hierarchy (subclasses httpx.HTTPStatusError)
-└── __init__.py     # Public exports: GraphClient, FileItem, exceptions
+├── _core.py           # GraphClient + _TokenProvider + retry logic
+├── _files.py          # FileItem, TreeNode, URL resolution, sheet matching
+├── _exceptions.py     # GraphError hierarchy (subclasses httpx.HTTPStatusError)
+├── _spreadsheetml.py  # SpreadsheetML 2003 (SAP ".xls") → xlsx bytes
+└── __init__.py        # Public exports: GraphClient, FileItem, exceptions
 ```
+
+`_spreadsheetml.py` is pure byte-in/byte-out — no HTTP, no client state. `read_excel`
+and `read_excel_many` funnel the downloaded bytes through the single entry point
+`prepare_excel_bytes(data, sheet)` before handing them to pandas; it returns the bytes
+unchanged for anything that is not SpreadsheetML. Route any new Excel-reading method
+through it too rather than calling `looks_like_spreadsheetml`/`to_xlsx_bytes` directly —
+one entry point is what stops the call sites from drifting apart.
+
+Detection is by content (BOM + namespace), never by extension. Conversion renames sheets
+whose titles xlsx cannot hold, so the caller's `sheet` name is remapped the same way —
+except for `sheet_match="glob"`, where `prepare_excel_bytes(..., sanitize_sheet_name=False)`
+keeps `[…]` meaningful as pattern syntax.
 
 ## Invariants — never break these
 

@@ -35,6 +35,7 @@ load_dotenv()
 - `item_path` is always relative to the drive root, e.g. `"Reports/Q1.xlsx"` (no leading slash).
 - All Graph HTTP errors raise a `GraphError` subclass (`AuthError` 401, `PermissionDeniedError` 403, `NotFoundError` 404, `RateLimitExhaustedError` when retries run out). `GraphError` subclasses `httpx.HTTPStatusError`, so old `except httpx.HTTPStatusError` code still works.
 - App-only auth (no username/password): only drive operations work, and `default_drive_id` is required. Mail/Teams/chat methods need delegated (username+password) auth.
+- Since v0.4.0, `read_excel`/`read_excel_many` auto-detect **SpreadsheetML 2003** files (SAP exports named `.xls` that are really UTF-16 XML) and decode them. Values only — styles/formulas dropped, `DateTime` cells arrive as strings. Sheet names illegal in xlsx (`\ / * ? : [ ]`, or >31 chars) are renamed on conversion; pass `sheet` as it appears in the source and it is mapped for you, except with `sheet_match="glob"` where the pattern is used verbatim. `list_excel_sheets` does **not** work on them (Graph workbook API needs a real xlsx; returns 403).
 
 ## GraphClient — instantiation
 
@@ -60,6 +61,10 @@ client = GraphClient(
 df = await client.read_excel(item_path="Reports/Q1.xlsx")
 df = await client.read_excel(item_path="Reports/Q1.xlsx", sheet="Summary")
 df = await client.read_excel(share_url="https://tenant.sharepoint.com/:x:/r/...", sheet=1)
+
+# SAP-style ".xls" that is really SpreadsheetML 2003 XML — decoded automatically
+df = await client.read_excel(item_path="TB/jan.xls", header=None)
+df = await client.read_excel_many(["TB/jan.xls", "TB/feb.xls"], header=None)
 
 # Read CSV → DataFrame
 df = await client.read_csv(item_path="data/users.csv", sep=";")

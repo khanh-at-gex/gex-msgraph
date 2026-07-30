@@ -82,6 +82,7 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Bulk read Excel:** `await client.read_excel_many(["A.xlsx", "B.xlsx"], on_error="warn")`
 - **Bulk read CSV (with status logging):** `df, status_df = await client.read_csv_many(["A.csv", "B.csv"], on_error="skip", return_status=True)`
 - **Read Parquet:** `await client.read_parquet(item_path="data.parquet")`
+- **Read a SAP-style `.xls` (SpreadsheetML 2003):** `await client.read_excel(item_path="TB/jan.xls")` — detected and decoded automatically, no flag needed.
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
 - **Search files:** `await client.search_files("budget", limit=25)` — `limit` is a hard cap on the returned list, not just a page-size hint.
@@ -142,6 +143,8 @@ Update the pin to `@v0.2.0` in `requirements.txt` or via `uv add "gex-msgraph @ 
 | `PermissionDeniedError` (403) | Ensure account has SharePoint access. Under app-only auth, check the app has *application* permissions and `default_drive_id` is set. |
 | `GraphSyncInLoopError` | You called a `*_sync` method inside Jupyter or an async app — use `await client.method(...)` directly instead. |
 | pip git error | Ensure git is installed and SSH agent is running. |
+| `CalamineError: Cannot detect file format` / `XLRDError: Expected BOF record` / `ValueError: Excel file format cannot be determined` on a `.xls` | The file is **SpreadsheetML 2003**, not a real `.xls` — plain XML (usually UTF-16) that Excel and SharePoint open happily because of its `<?mso-application progid="Excel.Sheet"?>` hint. Common with SAP exports. Confirm with the magic bytes: `open(f,"rb").read(4)` → `b"\xfe\xff\x00<"` (SpreadsheetML) vs `b"\xd0\xcf\x11\xe0"` (real `.xls`). **Handled automatically since v0.4.0** — `read_excel` / `read_excel_many` detect and decode it. If you hit this, upgrade. |
+| `PermissionDeniedError` (403) `Could not obtain a WAC access token` from `list_excel_sheets` | `list_excel_sheets` calls the Graph *workbook* API, which needs a genuine xlsx workbook server-side. It does not work on SpreadsheetML files (nor on `.xls`/`.csv`). Read the file instead and inspect `pd.ExcelFile(...).sheet_names` locally. |
 
 ---
 
@@ -359,6 +362,10 @@ async def read_excel(
 
 Download an Excel file and parse one sheet into a pandas DataFrame. Exactly one identifier must be provided.
 
+**SpreadsheetML 2003 is handled automatically (v0.4.0+).** Files that carry an `.xls` extension but are really XML Spreadsheet documents (typical of SAP exports — UTF-16 XML, magic bytes `fe ff` instead of `d0 cf 11 e0`) are detected by content and converted to xlsx in memory before parsing. No flag or kwarg is needed, and every kwarg below still applies. Only cell *values* survive the conversion — styles, formulas and merge geometry are dropped, and `ss:Type="DateTime"` cells arrive as strings (pass `parse_dates` or convert yourself). Detection is content-based, so genuine `.xlsx`/`.xls` files are untouched.
+
+Sheet names that xlsx cannot represent (containing `\ / * ? : [ ]`, or longer than 31 characters) are renamed during conversion, with a warning on the `gex_msgraph` logger. Pass `sheet` using the name as it appears in the source document — it is mapped the same way — except for `sheet_match="glob"` in `read_excel_many`, where the pattern is used verbatim so `[…]` keeps its character-class meaning and must therefore target the renamed title.
+
 **Parameters**
 
 - **`item_path`** (`str | None`, default `None`) — Path relative to the drive root.
@@ -473,6 +480,8 @@ async def read_excel_many(
 ```
 
 Read multiple Excel files concurrently and concatenate them into one DataFrame.
+
+Like `read_excel`, this transparently decodes **SpreadsheetML 2003** files (v0.4.0+) — see the note under `read_excel` for the renaming/caveats. `sheet`, `sheet_match` and `on_missing_sheet` all resolve against the source document's own sheet names (remapped internally when a title had to be sanitized), so they behave the same as on a native xlsx file.
 
 **Parameters**
 

@@ -24,7 +24,9 @@ gex-msgraph
 │   │   │                   on_error, add_source_column, return_status, **kwargs)
 │   │   ├── read_csv_many(paths, *, on_error, add_source_column,
 │   │   │                 return_status, **kwargs)
-│   │   └── list_excel_sheets(*, item_path|share_url|item_id)
+│   │   ├── list_excel_sheets(*, item_path|share_url|item_id)   xlsx workbooks only
+│   │   └── SpreadsheetML 2003  auto-detected + decoded by read_excel(_many)
+│   │                           (SAP ".xls" = UTF-16 XML) · values only
 │   │
 │   ├── Discovery
 │   │   ├── list_files(folder_path)           immediate children, files + folders

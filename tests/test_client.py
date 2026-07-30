@@ -1108,3 +1108,156 @@ async def test_read_csv_many_return_status(env_vars, mock_token):
             status_dict = status_df.set_index("path")["status"].to_dict()
             assert status_dict["f1.csv"] == "success"
             assert status_dict["f2.csv"] == "error"
+
+
+def _spreadsheetml_bytes() -> bytes:
+    """A SAP-style ``.xls``: SpreadsheetML 2003, UTF-16BE, with a bare ``&``,
+    a skipped column via ``ss:Index`` and a ``MergeAcross`` span."""
+    doc = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<?mso-application progid="Excel.Sheet"?>\n'
+        '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"'
+        ' xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
+        '<Worksheet ss:Name="Sheet1"><Table>'
+        "<Row>"
+        '<Cell><Data ss:Type="String">acct</Data></Cell>'
+        '<Cell ss:Index="3"><Data ss:Type="String">name</Data></Cell>'
+        '<Cell ss:MergeAcross="1"><Data ss:Type="String">amount</Data></Cell>'
+        "</Row>"
+        "<Row>"
+        '<Cell><Data ss:Type="String">111</Data></Cell>'
+        '<Cell ss:Index="3"><Data ss:Type="String">NH TMCP ĐT&PT Việt Nam</Data></Cell>'
+        '<Cell ss:MergeAcross="1"><Data ss:Type="Number">210491420093.00</Data></Cell>'
+        "</Row>"
+        "</Table></Worksheet></Workbook>"
+    )
+    return ("﻿" + doc).encode("utf-16-be")
+
+
+async def test_read_excel_handles_spreadsheetml(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get("https://graph.microsoft.com/v1.0/me/drive/root:/TB/jan.xls").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://dl.url/jan.xls"}
+            )
+        )
+        rm.get("https://dl.url/jan.xls").mock(
+            return_value=httpx.Response(200, content=_spreadsheetml_bytes())
+        )
+        async with GraphClient("das_u1") as client:
+            df = await client.read_excel(item_path="TB/jan.xls", header=None)
+
+    # 4 columns: acct, gap from ss:Index="3", name, amount. The column the
+    # MergeAcross swallows is trailing and empty, so it is not materialised.
+    assert df.shape == (2, 4)
+    assert df.iloc[0].tolist()[0] == "acct"
+    assert df.iloc[1, 0] == "111"
+    assert df.iloc[1, 2] == "NH TMCP ĐT&PT Việt Nam"
+    assert df.iloc[1, 3] == 210491420093.0
+
+
+def _spreadsheetml_named(sheet_name: str) -> bytes:
+    doc = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"'
+        ' xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
+        f'<Worksheet ss:Name="{sheet_name}"><Table>'
+        '<Row><Cell><Data ss:Type="String">v</Data></Cell></Row>'
+        "</Table></Worksheet></Workbook>"
+    )
+    return ("﻿" + doc).encode("utf-16-be")
+
+
+def _mock_xls(rm, name: str, content: bytes) -> None:
+    rm.get(f"https://graph.microsoft.com/v1.0/me/drive/root:/{name}").mock(
+        return_value=httpx.Response(
+            200, json={"@microsoft.graph.downloadUrl": f"https://dl.url/{name}"}
+        )
+    )
+    rm.get(f"https://dl.url/{name}").mock(
+        return_value=httpx.Response(200, content=content)
+    )
+
+
+async def test_read_excel_selects_sheet_renamed_by_conversion(env_vars, mock_token):
+    # xlsx cannot hold "Q1/Q2:[x]" as a title, so the conversion renames it.
+    # Selecting by the name the source document uses must still work.
+    with respx.mock(assert_all_called=False) as rm:
+        _mock_xls(rm, "odd.xls", _spreadsheetml_named("Q1/Q2:[x]"))
+        async with GraphClient("das_u1") as client:
+            df = await client.read_excel(
+                item_path="odd.xls", sheet="Q1/Q2:[x]", header=None
+            )
+    assert df.iat[0, 0] == "v"
+
+
+async def test_read_excel_many_matches_renamed_sheet(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        _mock_xls(rm, "odd.xls", _spreadsheetml_named("Q1/Q2:[x]"))
+        async with GraphClient("das_u1") as client:
+            df, status = await client.read_excel_many(
+                ["odd.xls"],
+                sheet="q1/q2:[x]",
+                sheet_match="ci",
+                header=None,
+                return_status=True,
+            )
+    assert status["status"].tolist() == ["success"]
+    assert df.iat[0, 0] == "v"
+
+
+async def test_read_excel_many_glob_pattern_is_not_sanitised(env_vars, mock_token):
+    # "[12]" is a character class, not text to be replaced — a glob request
+    # must reach match_sheet_name untouched.
+    with respx.mock(assert_all_called=False) as rm:
+        _mock_xls(rm, "g.xls", _spreadsheetml_named("Sales1"))
+        async with GraphClient("das_u1") as client:
+            df, status = await client.read_excel_many(
+                ["g.xls"],
+                sheet="Sales[12]",
+                sheet_match="glob",
+                header=None,
+                return_status=True,
+            )
+    assert status["status"].tolist() == ["success"]
+    assert df.iat[0, 0] == "v"
+
+
+async def test_read_excel_many_handles_spreadsheetml(env_vars, mock_token):
+    import pandas as pd
+
+    with respx.mock(assert_all_called=False) as rm:
+        for name in ("jan", "feb"):
+            rm.get(
+                f"https://graph.microsoft.com/v1.0/me/drive/root:/TB/{name}.xls"
+            ).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "@microsoft.graph.downloadUrl": f"https://dl.url/{name}.xls"
+                    },
+                )
+            )
+            rm.get(f"https://dl.url/{name}.xls").mock(
+                return_value=httpx.Response(200, content=_spreadsheetml_bytes())
+            )
+        async with GraphClient("das_u1") as client:
+            df, status_df = await client.read_excel_many(
+                ["TB/jan.xls", "TB/feb.xls"],
+                sheet="Sheet1",
+                header=None,
+                return_status=True,
+            )
+
+    assert isinstance(df, pd.DataFrame)
+    assert (status_df["status"] == "success").all()
+    # 2 rows per file, 4 columns plus the _source column from add_source_column
+    assert df.shape == (4, 5)
+    # header=None, so each file contributes its header row plus its data row
+    assert df[3].tolist() == [
+        "amount",
+        210491420093.0,
+        "amount",
+        210491420093.0,
+    ]
+    assert sorted(df["_source"].unique()) == ["TB/feb.xls", "TB/jan.xls"]

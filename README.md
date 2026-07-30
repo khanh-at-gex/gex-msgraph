@@ -2,7 +2,7 @@
 
 Async Python wrapper around Microsoft Graph API for clean access to M365 (SharePoint, OneDrive, Outlook, Teams) from any context — FastAPI, Prefect, scripts, notebooks.
 
-**Status:** v0.3.0 | Python >=3.11 | Internal/Private
+**Status:** v0.4.0 | Python >=3.11 | Internal/Private
 
 ## Quickstart
 
@@ -33,6 +33,14 @@ See **[CLAUDE.md](CLAUDE.md)** for architecture, invariants, and development wor
 Bump `__version__` in `__init__.py`, update the Changelog below, `git tag v0.X.Y`, `git push --tags`.
 
 ## Changelog
+
+### [0.4.0] - 2026-07-30
+
+#### Added
+- **SpreadsheetML 2003 support** — `read_excel` and `read_excel_many` now detect and decode XML Spreadsheet documents (SAP and similar exports named `.xls` but actually UTF-16 XML, magic bytes `fe ff` rather than `d0 cf 11 e0`). Every pandas engine rejects these; they are now converted to xlsx in memory before parsing, so all existing kwargs, sheet names and `sheet_match` behaviour carry over unchanged. Detection is by content, never by extension, so genuine `.xlsx`/`.xls` files take the original path. Values only: styles, formulas and merge geometry are dropped, and `ss:Type="DateTime"` cells arrive as strings. `list_excel_sheets` still does not work on these files — it calls the Graph workbook API, which needs a real xlsx server-side.
+
+#### Fixed
+- `mypy --strict` is clean again: `upload_many` / `send_mail` had bare `os.PathLike` and `list[dict]` annotations plus two stale `type: ignore` comments.
 
 ### [0.3.0] - 2026-07-17
 
