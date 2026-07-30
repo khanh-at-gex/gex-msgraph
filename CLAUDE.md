@@ -51,6 +51,7 @@ keeps `[…]` meaningful as pattern syntax.
 - Retry only on **429 and 5xx**. Never retry 4xx (auth/permission errors should surface immediately).
 - **Raise `GraphError` subclasses** (via `raise_graph_error` in `_exceptions.py`) for HTTP failures, never bare `raise_for_status()`. `GraphError` must keep subclassing `httpx.HTTPStatusError` — consumer code depends on it.
 - The chunked-upload PUTs (`_put_chunk_with_retry`) and `_stream_to_path` share `_stream_to_bytes`'s no-Bearer/retry contract — keep all three in sync with `_request`'s backoff behavior.
+- **Any `root:/{path}` URL or `parentReference.path` JSON value MUST go through `encode_drive_path()` in `_files.py`** — never interpolate a raw `item_path`/`folder_path` directly. Unencoded `?`/`#` silently truncate the path (parsed as query string / fragment) instead of erroring. `search_files`'s OData `q='...'` literal is a separate concern — it needs `'` doubled (`''`) *before* percent-encoding, not `encode_drive_path`.
 
 ## Common patterns
 

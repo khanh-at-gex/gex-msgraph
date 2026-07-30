@@ -23,7 +23,12 @@ from gex_msgraph._exceptions import (
     NotFoundError,
     raise_graph_error,
 )
-from gex_msgraph._files import FileItem, build_resolution_url, validate_identifier
+from gex_msgraph._files import (
+    FileItem,
+    build_resolution_url,
+    encode_drive_path,
+    validate_identifier,
+)
 from gex_msgraph._spreadsheetml import prepare_excel_bytes
 
 logger = logging.getLogger("gex_msgraph")
@@ -680,7 +685,7 @@ class GraphClient:
         clean_path = folder_path.lstrip("/")
 
         if clean_path:
-            base_url = f"{drive_root}/root:/{clean_path}:/children"
+            base_url = f"{drive_root}/root:/{encode_drive_path(clean_path)}:/children"
         else:
             base_url = f"{drive_root}/root/children"
 
@@ -715,7 +720,7 @@ class GraphClient:
         clean_path = folder_path.lstrip("/")
 
         if clean_path:
-            url = f"{drive_root}/root:/{clean_path}:/children"
+            url = f"{drive_root}/root:/{encode_drive_path(clean_path)}:/children"
         else:
             url = f"{drive_root}/root/children"
 
@@ -760,7 +765,7 @@ class GraphClient:
         dest_clean = dest_folder_path.lstrip("/")
         return {
             "path": (
-                f"{drive_root}/root:/{dest_clean}"
+                f"{drive_root}/root:/{encode_drive_path(dest_clean)}"
                 if dest_clean
                 else f"{drive_root}/root"
             )
@@ -798,14 +803,13 @@ class GraphClient:
     async def create_folder(self, folder_path: str) -> FileItem:
         """Create a new folder."""
         from gex_msgraph._files import parse_drive_item
-        import urllib.parse
 
         drive_root = self._drive_root()
         clean_path = folder_path.lstrip("/")
 
         if "/" in clean_path:
             parent, name = clean_path.rsplit("/", 1)
-            encoded_parent = urllib.parse.quote(parent)
+            encoded_parent = encode_drive_path(parent)
             url = f"{drive_root}/root:/{encoded_parent}:/children"
         else:
             name = clean_path
@@ -979,7 +983,12 @@ class GraphClient:
         if limit <= 0:
             return []
 
-        encoded_query = urllib.parse.quote(query)
+        # OData v4 escapes a literal "'" inside a string literal by doubling
+        # it; percent-encoding alone only protects the value in transport,
+        # not the OData expression Graph parses after decoding the path
+        # segment — so an un-doubled "'" would close the literal early.
+        odata_query = query.replace("'", "''")
+        encoded_query = urllib.parse.quote(odata_query)
         url = f"{self._drive_root()}/root/search(q='{encoded_query}')?$top={limit}"
         results: list[FileItem] = []
         async for item in self._iter_paginated(url):
@@ -996,15 +1005,13 @@ class GraphClient:
         Files over ~4 MiB are transparently uploaded via a Graph upload
         session in chunks (simple PUT :/content is capped by Graph).
         """
-        import urllib.parse
-
         local_p = Path(local_path)
         if not local_p.is_file():
             raise FileNotFoundError(f"File not found: {local_path}")
 
         drive_root = self._drive_root()
         clean_remote = remote_path.lstrip("/")
-        encoded_path = urllib.parse.quote(clean_remote)
+        encoded_path = encode_drive_path(clean_remote)
 
         if local_p.stat().st_size > _UPLOAD_SESSION_THRESHOLD:
             return await self._upload_via_session(local_p, encoded_path)

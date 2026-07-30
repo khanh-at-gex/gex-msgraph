@@ -1261,3 +1261,50 @@ async def test_read_excel_many_handles_spreadsheetml(env_vars, mock_token):
         210491420093.0,
     ]
     assert sorted(df["_source"].unique()) == ["TB/feb.xls", "TB/jan.xls"]
+
+
+async def test_get_metadata_encodes_special_characters_in_path(env_vars, mock_token):
+    # Registering the route at the encoded URL means the request only
+    # matches if the client actually percent-encodes "?" before sending it —
+    # unencoded, "?b.xlsx" would be parsed as a query string and this route
+    # (and the real Graph endpoint) would never see it as part of the path.
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/drive/root:/Reports/a%3Fb.xlsx"
+        ).mock(return_value=httpx.Response(200, json={"name": "a?b.xlsx", "size": 5}))
+
+        async with GraphClient("das_u1") as client:
+            meta = await client.get_metadata(item_path="Reports/a?b.xlsx")
+    assert meta.name == "a?b.xlsx"
+
+
+async def test_search_files_escapes_apostrophe(env_vars, mock_token):
+    # OData escapes a literal "'" inside a string literal by doubling it.
+    # Registering the route with the doubled-then-encoded literal proves the
+    # fix: a plain percent-encode of "O'Brien" (O%27Brien) would not match.
+    with respx.mock(assert_all_called=False) as rm:
+        rm.get(
+            "https://graph.microsoft.com/v1.0/me/drive/root/search(q='O%27%27Brien')"
+            "?$top=25"
+        ).mock(
+            return_value=httpx.Response(
+                200, json={"value": [{"name": "O'Brien notes.docx", "size": 1}]}
+            )
+        )
+        async with GraphClient("das_u1") as client:
+            results = await client.search_files("O'Brien")
+    assert len(results) == 1
+    assert results[0].name == "O'Brien notes.docx"
+
+
+async def test_move_file_encodes_special_characters_in_dest(env_vars, mock_token):
+    with respx.mock(assert_all_called=False) as rm:
+        route = rm.patch("https://graph.microsoft.com/v1.0/me/drive/root:/a.xlsx")
+        route.mock(return_value=httpx.Response(200, json={"name": "a.xlsx"}))
+
+        async with GraphClient("das_u1") as client:
+            await client.move_file(item_path="a.xlsx", dest_folder_path="Dest #1")
+
+    payload = route.calls[0].request.read().decode()
+    assert "Dest%20%231" in payload
+    assert "Dest #1" not in payload

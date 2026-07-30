@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from gex_msgraph._files import (
     validate_identifier,
     encode_share_url,
+    encode_drive_path,
     build_resolution_url,
     match_sheet_name,
     parse_drive_item,
@@ -33,6 +34,21 @@ def test_build_resolution_url():
     url = "https://tenant.sharepoint.com/a"
     encoded = encode_share_url(url)
     assert build_resolution_url("share", url, "/me/drive") == f"/shares/{encoded}/driveItem"
+
+def test_build_resolution_url_encodes_special_characters():
+    # "?" and "#" are URL metacharacters — unencoded, they truncate the path
+    # (query string / fragment) instead of addressing the file.
+    assert build_resolution_url("path", "Reports/a?b.xlsx", "/me/drive") == "/me/drive/root:/Reports/a%3Fb.xlsx"
+    assert build_resolution_url("path", "a#b.xlsx", "/me/drive") == "/me/drive/root:/a%23b.xlsx"
+    assert build_resolution_url("path", "50% done.xlsx", "/me/drive") == "/me/drive/root:/50%25%20done.xlsx"
+    assert build_resolution_url("path", "Báo cáo Q1.xlsx", "/me/drive") == "/me/drive/root:/B%C3%A1o%20c%C3%A1o%20Q1.xlsx"
+
+def test_encode_drive_path():
+    assert encode_drive_path("file.xlsx") == "file.xlsx"
+    assert encode_drive_path("a/b c") == "a/b%20c"  # "/" preserved as separator
+    assert encode_drive_path("Reports/a?b.xlsx") == "Reports/a%3Fb.xlsx"
+    assert encode_drive_path("a#b.xlsx") == "a%23b.xlsx"
+    assert encode_drive_path("50% done.xlsx") == "50%25%20done.xlsx"
 
 def test_match_sheet_name():
     sheets = ["Sheet1", "data", "REPORT_2026"]

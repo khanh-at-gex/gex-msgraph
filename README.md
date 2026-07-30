@@ -2,7 +2,7 @@
 
 Async Python wrapper around Microsoft Graph API for clean access to M365 (SharePoint, OneDrive, Outlook, Teams) from any context — FastAPI, Prefect, scripts, notebooks.
 
-**Status:** v0.4.0 | Python >=3.11 | Internal/Private
+**Status:** v0.4.1 | Python >=3.11 | Internal/Private
 
 ## Quickstart
 
@@ -33,6 +33,12 @@ See **[CLAUDE.md](CLAUDE.md)** for architecture, invariants, and development wor
 Bump `__version__` in `__init__.py`, update the Changelog below, `git tag v0.X.Y`, `git push --tags`.
 
 ## Changelog
+
+### [0.4.1] - 2026-07-30
+
+#### Fixed
+- **Path percent-encoding.** `item_path`/`folder_path`/`dest_folder_path` were interpolated unencoded into Graph's `root:/{path}` URL/JSON syntax. A `?` or `#` in a filename silently truncated the path (parsed as a query string or fragment) instead of addressing the file — affecting `download`, `read_excel`, `read_csv`, `read_parquet`, `read_excel_many`, `read_csv_many`, `get_metadata`, `exists`, `delete_file`, `move_file`, `copy_file`, `list_excel_sheets`, `get_share_link`, `list_files`, and `walk`. All path-building now goes through one `encode_drive_path()` helper.
+- **`search_files` and apostrophes.** A `'` in the query (e.g. `search_files("O'Brien")`) closed the OData string literal early, corrupting the search expression server-side. Now doubled (`''`) per OData v4 escaping before percent-encoding.
 
 ### [0.4.0] - 2026-07-30
 

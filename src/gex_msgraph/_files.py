@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import quote
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,14 @@ def encode_share_url(url: str) -> str:
     return f"u!{b64.rstrip('=')}"
 
 
+def encode_drive_path(path: str) -> str:
+    """Percent-encode a drive-relative path segment for Graph's `root:/{path}`
+    colon syntax — used both in request URLs and in `parentReference.path`
+    JSON values, which Graph parses with the same syntax. Preserves "/" as
+    the path separator."""
+    return quote(path, safe="/")
+
+
 def build_resolution_url(
     kind: Literal["path", "share", "id"],
     value: str,
@@ -73,7 +82,7 @@ def build_resolution_url(
     """
     if kind == "path":
         clean_path = value.lstrip("/")
-        return f"{drive_root}/root:/{clean_path}"
+        return f"{drive_root}/root:/{encode_drive_path(clean_path)}"
     elif kind == "share":
         encoded_url = encode_share_url(value)
         return f"/shares/{encoded_url}/driveItem"
