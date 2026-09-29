@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import NoReturn
 
 import httpx
@@ -49,6 +50,16 @@ _STATUS_MAP: dict[int, type[GraphError]] = {
 }
 
 
+# /shares/u!{base64url(link)} embeds the sharing link, token included.
+_SHARE_ID_RE = re.compile(r"(/shares/)[^/?#]+")
+
+
+def redact_url(url: object) -> str:
+    """Mask the encoded sharing link in a Graph URL before it hits a log or
+    exception message."""
+    return _SHARE_ID_RE.sub(r"\1<redacted>", str(url))
+
+
 def raise_graph_error(
     response: httpx.Response, *, retries_exhausted: bool = False
 ) -> NoReturn:
@@ -59,6 +70,7 @@ def raise_graph_error(
     else:
         cls = _STATUS_MAP.get(status, GraphError)
     message = (
-        f"{status} error for {response.request.method} '{response.request.url}'"
+        f"{status} error for {response.request.method} "
+        f"'{redact_url(response.request.url)}'"
     )
     raise cls(message, request=response.request, response=response)

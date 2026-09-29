@@ -42,7 +42,7 @@ MS_DAS_U1_PASSWORD=your_password
 ```
 
 ## 5. Find SharePoint IDs
-Use Graph Explorer (`https://developer.microsoft.com/en-us/graph/graph-explorer`) to find your Site ID and Drive ID if needed. Add `MS_DAS_U1_DEFAULT_DRIVE_ID` to `.env`.
+Easiest: paste a folder link from the browser into `await client.resolve_folder_url(link)` — it returns the drive ID and folder path (see [`resolve_folder_url`](#graphclientresolve_folder_url)). Otherwise, use Graph Explorer (`https://developer.microsoft.com/en-us/graph/graph-explorer`) to find your Site ID and Drive ID if needed. Add `MS_DAS_U1_DEFAULT_DRIVE_ID` to `.env`.
 
 ## 6. First call
 ```python
@@ -83,6 +83,8 @@ df = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 - **Bulk read CSV (with status logging):** `df, status_df = await client.read_csv_many(["A.csv", "B.csv"], on_error="skip", return_status=True)`
 - **Read Parquet:** `await client.read_parquet(item_path="data.parquet")`
 - **Read a SAP-style `.xls` (SpreadsheetML 2003):** `await client.read_excel(item_path="TB/jan.xls")` — detected and decoded automatically, no flag needed.
+- **Resolve a browser folder link:** `loc = await client.resolve_folder_url(link)` → `await client.with_drive(loc.drive_id).walk(loc.folder_path)`
+- **List a site's libraries:** `await client.list_site_drives("https://tenant.sharepoint.com/sites/Name")`
 - **List files:** `await client.list_files("Folder")`
 - **Walk recursively with glob:** `await client.walk("Folder", pattern="*.xlsx")`
 - **Search files:** `await client.search_files("budget", limit=25)` — `limit` is a hard cap on the returned list, not just a page-size hint.
@@ -150,7 +152,7 @@ Update the pin to `@v0.2.0` in `requirements.txt` or via `uv add "gex-msgraph @ 
 
 ## API Reference
 
-Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode, GraphError, AuthError, PermissionDeniedError, NotFoundError, RateLimitExhaustedError, GraphAuthenticationError, GraphSyncInLoopError`
+Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode, DriveLocation, GraphError, AuthError, PermissionDeniedError, NotFoundError, RateLimitExhaustedError, GraphAuthenticationError, GraphSyncInLoopError`
 
 ---
 
@@ -196,6 +198,21 @@ Immutable dataclass representing a file or folder in OneDrive / SharePoint.
 
 ---
 
+### `DriveLocation`
+
+Immutable dataclass returned by [`resolve_folder_url`](#graphclientresolve_folder_url).
+
+**Fields**
+
+- **`drive_id`** (`str`) — Drive (document library) ID; pass to `with_drive`.
+- **`folder_path`** (`str | None`) — Folder path relative to the drive root, no leading/trailing `/`; `""` is the drive root. `None` only for a sharing link whose target Graph returns without a parent path — use `item_id` then.
+- **`item_id`** (`str`) — driveItem ID of the folder.
+- **`drive_name`** (`str`) — Library display name (e.g. `"Documents"`, or a localized name). `""` if not readable (sharing links only).
+- **`drive_web_url`** (`str`) — Library URL. `""` if not readable (sharing links only).
+- **`site_id`** (`str | None`) — Site ID; `None` when resolved from a sharing link and Graph returns no site.
+
+---
+
 ### `TreeNode`
 
 Recursive tree node returned by [`get_folder_tree`](#graphclientget_folder_treefolderpath). Rendered with `print()`.
@@ -233,7 +250,7 @@ Async client for Microsoft Graph API. Manages authentication (delegated ROPC or 
 #### Authentication flows
 
 - **Delegated (ROPC)** — provide `username` + `password` along with `client_id`/`client_secret`/`tenant_id`. The client acts as that signed-in user; all methods work.
-- **App-only (client credentials)** — omit **both** `username` and `password`. The client acts as the application itself, with *application* permissions instead of delegated ones. **Constraint:** `/me/*` endpoints have no meaning without a signed-in user, so under app-only auth `send_mail`, `list_mail`, `list_chats`, `get_chat_messages`, `send_chat_message` do not work, and all drive operations require `default_drive_id` to be set (the `/me/drive` default cannot resolve). Use app-only for drive-scoped automation on a known SharePoint drive; use ROPC when you need mail/Teams or `/me/drive`.
+- **App-only (client credentials)** — omit **both** `username` and `password`. The client acts as the application itself, with *application* permissions instead of delegated ones. **Constraint:** `/me/*` endpoints have no meaning without a signed-in user, so under app-only auth `send_mail`, `list_mail`, `list_chats`, `get_chat_messages`, `send_chat_message` do not work, and drive operations need a drive: set `default_drive_id`, or derive a client with `with_drive(drive_id)` (e.g. from `resolve_folder_url`). Since v0.5.0 this is checked on the first drive-scoped call, not at construction. Use app-only for drive-scoped automation on a known SharePoint drive; use ROPC when you need mail/Teams or `/me/drive`.
 
 #### `GraphClient.__init__`
 
@@ -260,14 +277,14 @@ GraphClient(
 - **`tenant_id`** (`str | None`, default `None`) — Azure tenant (directory) ID. Overrides `MS_<ACCOUNT>_TENANT_ID`. Required.
 - **`username`** (`str | None`, default `None`) — Service account UPN (e.g. `svc@company.com`). Overrides `MS_<ACCOUNT>_USERNAME`. Provide together with `password` for delegated (ROPC) auth; omit both for app-only auth.
 - **`password`** (`str | None`, default `None`) — Service account password. Overrides `MS_<ACCOUNT>_PASSWORD`. Paired with `username`.
-- **`default_drive_id`** (`str | None`, default `None`) — Drive ID. When set, all drive-scoped URLs use `/drives/{id}` instead of `/me/drive`. Readable from `MS_<ACCOUNT>_DEFAULT_DRIVE_ID`. **Required under app-only auth.**
+- **`default_drive_id`** (`str | None`, default `None`) — Drive ID. When set, all drive-scoped URLs use `/drives/{id}` instead of `/me/drive`. Readable from `MS_<ACCOUNT>_DEFAULT_DRIVE_ID`. Under app-only auth, drive-scoped methods raise `ValueError` unless this is set or the client comes from `with_drive`.
 - **`max_concurrent`** (`int | None`, default `10`) — Maximum simultaneous in-flight Graph requests per client instance. Readable from `MS_<ACCOUNT>_MAX_CONCURRENT`.
 - **`request_timeout`** (`float | None`, default `30.0`) — Per-request HTTP timeout in seconds. Readable from `MS_<ACCOUNT>_REQUEST_TIMEOUT`.
 
 **Raises**
 
 - **`KeyError`** — If `client_id`, `client_secret`, or `tenant_id` is neither provided explicitly nor found in the environment.
-- **`ValueError`** — If only one of `username` / `password` is provided (they must come as a pair, or both be absent for app-only auth), or if app-only auth is used without `default_drive_id`.
+- **`ValueError`** — If only one of `username` / `password` is provided (they must come as a pair, or both be absent for app-only auth).
 
 **Notes**
 
@@ -285,7 +302,7 @@ client = GraphClient(
     client_id="...",
     client_secret="...",
     tenant_id="...",
-    default_drive_id="b!abc123",  # required for app-only
+    default_drive_id="b!abc123",  # or use client.with_drive(...) later
     max_concurrent=5,
 )
 ```
@@ -294,7 +311,40 @@ client = GraphClient(
 
 #### `GraphClient.close()` / `GraphClient.close_sync()`
 
-`close()` (async) closes the underlying HTTP client; safe to call multiple times; called automatically when the client is used as an async context manager. `close_sync()` is the synchronous companion for scripts that only use the `*_sync` wrappers — it also stops the background event loop those wrappers run on.
+`close()` (async) closes the underlying HTTP client; safe to call multiple times; called automatically when the client is used as an async context manager. `close_sync()` is the synchronous companion for scripts that only use the `*_sync` wrappers — it also stops the background event loop those wrappers run on. Both are no-ops on a client made by `with_drive` — the owner closes the shared resources.
+
+---
+
+#### `GraphClient.with_drive`
+
+```python
+def with_drive(drive_id: str) -> GraphClient
+```
+
+Return a client whose drive-scoped methods target `/drives/{drive_id}`. It **shares** the owner's token provider, httpx client, concurrency semaphore and sync loop — no new sign-in, no new connection pool.
+
+**Parameters**
+
+- **`drive_id`** (`str`) — Drive ID, e.g. `DriveLocation.drive_id`.
+
+**Returns**
+
+`GraphClient` — the derived client. The original client is unchanged.
+
+**Raises**
+
+- **`ValueError`** — `drive_id` is empty.
+
+**Notes**
+
+The owner keeps ownership: `close()` / `close_sync()` on the derived client do nothing, and it stops working once the owner is closed. Deriving from a derived client still attaches to the original owner.
+
+**Example**
+
+```python
+async with GraphClient("das_u1") as client:
+    archive = client.with_drive("b!archive-drive-id")
+    await archive.list_files("2024")
 
 ---
 
@@ -636,6 +686,79 @@ sheets = await client.list_excel_sheets(item_path="Finance/budget.xlsx")
 ---
 
 ### File & Folder Discovery
+
+---
+
+#### `GraphClient.resolve_folder_url`
+
+```python
+async def resolve_folder_url(url: str) -> DriveLocation
+def resolve_folder_url_sync(url: str) -> DriveLocation
+```
+
+Resolve a SharePoint/OneDrive folder link copied from the browser to its drive and drive-relative folder path. No drive needs to be configured on the client — works under app-only auth too.
+
+Supported links:
+
+- **Library view** — `https://{host}/sites/{site}/{lib}/Forms/AllItems.aspx?id=%2Fsites%2F…` (or older `RootFolder=`); other query parameters (`viewid`, `FolderCTID`, …) are ignored. A view without `id` means the library root.
+- **Direct folder URL** — `https://{host}/sites/{site}/{lib}/{path}` (trailing `/` optional), `/teams/{site}/…`, OneDrive `https://{tenant}-my.sharepoint.com/personal/{user}/Documents/…`. Subsites are tried up to three levels deep.
+- **Sharing link** — `https://{host}/:f:/s/…`, `/:f:/r/…`, `/:f:/g/…`.
+
+The library is matched by the drive's `webUrl` — the longest prefix of the folder URL, compared per path segment, case-insensitively, after Unicode NFC normalization — never by name ("Shared Documents" in the URL is named "Documents", or a localized name). The result is verified to be a folder. Site → drives lookups are cached per client.
+
+**Parameters**
+
+- **`url`** (`str`) — The folder link.
+
+**Returns**
+
+[`DriveLocation`](#drivelocation). For sharing links, `folder_path` is `None` if Graph returns no parent path, and `drive_name`/`drive_web_url` are `""` if the drive's metadata is not readable.
+
+**Raises**
+
+- **`ValueError`** — Not a supported SharePoint folder link (message lists the supported forms), or the link points to a file.
+- **`NotFoundError`** — No site, library or folder matches the link.
+- **`AuthError` / `PermissionDeniedError`** — 401 / 403 from Graph.
+
+Sharing-link tokens are never included in error messages or logs.
+
+**Example**
+
+```python
+async with GraphClient("das_u1") as client:
+    loc = await client.resolve_folder_url(link_copied_from_browser)
+    files = await client.with_drive(loc.drive_id).walk(loc.folder_path)
+```
+
+---
+
+#### `GraphClient.list_site_drives`
+
+```python
+async def list_site_drives(site_url: str) -> list[dict[str, Any]]
+```
+
+List a SharePoint site's document libraries.
+
+**Parameters**
+
+- **`site_url`** (`str`) — Site URL, e.g. `https://tenant.sharepoint.com/sites/Name` (also `/teams/…`, subsites, `https://{tenant}-my.sharepoint.com/personal/{user}`; the root site is `https://tenant.sharepoint.com`).
+
+**Returns**
+
+`list[dict]` — one dict per library with keys `id`, `name`, `webUrl`, `driveType`. Cached per client.
+
+**Raises**
+
+- **`ValueError`** — `site_url` is not an absolute URL.
+- **`NotFoundError`** / **`PermissionDeniedError`** — site not found / not accessible.
+
+**Example**
+
+```python
+for d in await client.list_site_drives("https://tenant.sharepoint.com/sites/Audit"):
+    print(d["name"], d["id"])
+```
 
 ---
 

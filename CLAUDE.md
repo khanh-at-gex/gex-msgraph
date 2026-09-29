@@ -46,6 +46,8 @@ keeps `[…]` meaningful as pattern syntax.
 - **All Graph HTTP calls MUST go through `_request()`** — it handles auth header injection, semaphore, and retry.
   - Exception: `_stream_to_bytes` (used by `download`) fetches Graph's pre-authenticated `downloadUrl`, which must NOT get a Bearer header, so it can't go through `_request()`. It keeps its own 429/5xx retry loop reusing `_compute_backoff`/`_DEFAULT_MAX_RETRIES` — keep both retry loops in sync if backoff behavior changes.
 - **Never log credentials** — tokens, passwords, secrets. Logger is `logging.getLogger("gex_msgraph")`.
+  - Graph URLs in logs/exception messages go through `redact_url()` (`_exceptions.py`): `/shares/u!…` is the base64 of a sharing link, token included. Never echo a raw `share_url` either.
+- **Clients from `with_drive()` share the owner's `_client`/`_provider`/`_semaphore`/sync loop** (`_owner` is set). They must never close or re-create those — `close()`/`close_sync()` are no-ops and `_run_sync` delegates to the owner. New per-client state added in `__init__` is copied to children via `__dict__`, so keep it shareable or reset it in `with_drive`.
 - **Do not add dependencies** without discussion (`httpx`, `msal`, `pandas`, `openpyxl`, `python-calamine` only; `python-dotenv` is an optional extra, never import it in `src/`).
 - **`_TokenProvider.get_token()` is synchronous** — always call via `asyncio.to_thread()` inside async context.
 - Retry only on **429 and 5xx**. Never retry 4xx (auth/permission errors should surface immediately).

@@ -12,11 +12,12 @@ from gex_msgraph._exceptions import (
     PermissionDeniedError,
     RateLimitExhaustedError,
 )
-from gex_msgraph._files import FileItem, TreeNode
+from gex_msgraph._files import DriveLocation, FileItem, TreeNode
 
 __all__ = [
     "GraphClient",
     "FileItem",
+    "DriveLocation",
     "TreeNode",
     "GraphError",
     "AuthError",
@@ -26,4 +27,4 @@ __all__ = [
     "GraphAuthenticationError",
     "GraphSyncInLoopError",
 ]
-__version__ = "0.4.1"
+__version__ = "0.5.0"

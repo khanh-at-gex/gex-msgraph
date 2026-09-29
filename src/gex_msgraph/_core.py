@@ -9,6 +9,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast, overload
+from urllib.parse import unquote, urlsplit
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -21,12 +22,20 @@ from gex_msgraph._exceptions import (
     GraphAuthenticationError,
     GraphSyncInLoopError,
     NotFoundError,
+    PermissionDeniedError,
     raise_graph_error,
+    redact_url,
 )
 from gex_msgraph._files import (
+    DriveLocation,
     FileItem,
     build_resolution_url,
+    candidate_site_paths,
     encode_drive_path,
+    encode_share_url,
+    match_drive,
+    parse_folder_url,
+    shared_item_folder_path,
     validate_identifier,
 )
 from gex_msgraph._spreadsheetml import prepare_excel_bytes
@@ -87,6 +96,11 @@ def _load_account_env(name: str) -> dict[str, str]:
         res[k.lower()] = os.environ.get(prefix + k, default_val)
 
     return res
+
+
+def _require_folder(item: dict[str, Any]) -> None:
+    if "folder" not in item:
+        raise ValueError("The link points to a file, not a folder")
 
 
 def _compute_backoff(attempt: int, retry_after: str | None) -> float:
@@ -192,14 +206,10 @@ class GraphClient:
             else cfg.get("default_drive_id", "")
         )
 
-        # App-only tokens have no signed-in user, so the /me/drive default
-        # cannot resolve — fail at construction, not on the first request.
-        if resolved_username is None and not self._default_drive_id:
-            raise ValueError(
-                "App-only auth (no username/password) requires default_drive_id "
-                f"(or MS_{self.account.upper()}_DEFAULT_DRIVE_ID), because /me/* "
-                "endpoints have no meaning without a signed-in user."
-            )
+        # App-only tokens have no signed-in user, so /me/drive cannot resolve.
+        # A drive is only required by drive-scoped methods (see _drive_root),
+        # so app-only clients can still resolve links and use with_drive().
+        self._app_only = resolved_username is None
 
         self._provider = _TokenProvider(
             **creds, username=resolved_username, password=resolved_password
@@ -222,8 +232,32 @@ class GraphClient:
         # httpx client/semaphore stay bound to one loop across sync calls.
         self._sync_loop: asyncio.AbstractEventLoop | None = None
         self._sync_thread: threading.Thread | None = None
+        # Set on clients made by with_drive(): the owner holds the httpx
+        # client and sync loop, so sync work and closing route through it.
+        self._owner: GraphClient | None = None
+        # "{host}{site_path}" (casefolded) -> (site_id, drives)
+        self._site_drives_cache: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+
+    def with_drive(self, drive_id: str) -> "GraphClient":
+        """Return a client scoped to ``/drives/{drive_id}``.
+
+        The new client shares this client's token provider, httpx client,
+        concurrency semaphore and sync loop — no new sign-in. This client
+        (the owner) keeps ownership of those resources: closing the derived
+        client is a no-op, and it stops working once the owner is closed.
+        """
+        if not drive_id:
+            raise ValueError("drive_id must be a non-empty string")
+        owner = self._owner or self
+        child = object.__new__(GraphClient)
+        child.__dict__.update(owner.__dict__)
+        child._default_drive_id = drive_id
+        child._owner = owner
+        return child
 
     def _run_sync(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        if self._owner is not None:
+            return self._owner._run_sync(coro)
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -257,7 +291,12 @@ class GraphClient:
             self._sync_thread = None
 
     async def close(self) -> None:
-        """Close the underlying httpx client. Safe to call multiple times."""
+        """Close the underlying httpx client. Safe to call multiple times.
+
+        No-op on a client made by with_drive(); its owner closes the
+        shared resources."""
+        if self._owner is not None:
+            return
         if self._sync_loop is not None:
             # The httpx client is bound to the background sync loop — closing
             # it from this loop would be a cross-loop call. Delegate to
@@ -268,6 +307,8 @@ class GraphClient:
 
     def close_sync(self) -> None:
         """Close from synchronous code — companion to the *_sync methods."""
+        if self._owner is not None:
+            return
         if self._sync_loop is not None:
             future = asyncio.run_coroutine_threadsafe(
                 self._client.aclose(), self._sync_loop
@@ -287,11 +328,16 @@ class GraphClient:
 
     def _drive_root(self) -> str:
         """URL fragment for the drive scope, e.g. ``/me/drive`` or ``/drives/{id}``."""
-        return (
-            f"/drives/{self._default_drive_id}"
-            if self._default_drive_id
-            else "/me/drive"
-        )
+        if self._default_drive_id:
+            return f"/drives/{self._default_drive_id}"
+        if self._app_only:
+            raise ValueError(
+                "App-only auth (no username/password) has no /me/drive: set "
+                f"default_drive_id (or MS_{self.account.upper()}_DEFAULT_DRIVE_ID), "
+                "or call client.with_drive(drive_id) — e.g. with the drive_id "
+                "from resolve_folder_url()."
+            )
+        return "/me/drive"
 
     def _resolve_item_url(
         self,
@@ -306,7 +352,9 @@ class GraphClient:
         )
         assert value is not None
 
-        url = build_resolution_url(kind, value, self._drive_root())
+        # Share URLs are drive-independent — don't demand a drive for them.
+        drive_root = "" if kind == "share" else self._drive_root()
+        url = build_resolution_url(kind, value, drive_root)
         return kind, url
 
     async def _request(self, method: str, url: str, **kw: Any) -> httpx.Response:
@@ -322,11 +370,13 @@ class GraphClient:
             kw["headers"] = headers
 
             async with self._semaphore:
-                logger.debug("Graph request %s %s", method, url)
+                logger.debug("Graph request %s %s", method, redact_url(url))
                 response = await self._client.request(method, url, **kw)
 
             status = response.status_code
-            logger.debug("Graph response %s %s -> %s", method, url, status)
+            logger.debug(
+                "Graph response %s %s -> %s", method, redact_url(url), status
+            )
 
             if status < 400:
                 return response
@@ -340,7 +390,7 @@ class GraphClient:
                 logger.info(
                     "Retrying %s %s in %.1fs (attempt %s)",
                     method,
-                    url,
+                    redact_url(url),
                     backoff,
                     attempt + 1,
                 )
@@ -365,7 +415,9 @@ class GraphClient:
         data = resp.json()
         download_url = data.get("@microsoft.graph.downloadUrl")
         if not download_url:
-            raise RuntimeError(f"Could not resolve download URL for item: {item_path or share_url or item_id}")
+            # Never echo share_url: sharing links carry an access token.
+            item = item_path or item_id or "<share_url>"
+            raise RuntimeError(f"Could not resolve download URL for item: {item}")
         return str(download_url)
 
     async def _stream_to_bytes(self, url: str) -> bytes:
@@ -997,6 +1049,147 @@ class GraphClient:
                 break
         return results[:limit]
 
+    async def list_site_drives(self, site_url: str) -> list[dict[str, Any]]:
+        """List a SharePoint site's document libraries (drives).
+
+        ``site_url`` is the site's browser URL, e.g.
+        ``https://contoso.sharepoint.com/sites/Audit`` — ``/teams/…``,
+        subsites and ``https://{tenant}-my.sharepoint.com/personal/{user}``
+        work too. Returns dicts with ``id``, ``name``, ``webUrl`` and
+        ``driveType``. Cached per client: one site costs one round trip.
+        """
+        parts = urlsplit(site_url.strip())
+        host = (parts.hostname or "").lower()
+        if parts.scheme not in ("http", "https") or not host:
+            raise ValueError(
+                "site_url must be an absolute URL, e.g. "
+                "https://contoso.sharepoint.com/sites/Name"
+            )
+        _, drives = await self._get_site_drives(host, unquote(parts.path).rstrip("/"))
+        return drives
+
+    async def _get_site_drives(
+        self, host: str, site_path: str
+    ) -> tuple[str, list[dict[str, Any]]]:
+        key = f"{host}{site_path}".casefold()
+        cached = self._site_drives_cache.get(key)
+        if cached is not None:
+            return cached
+
+        # Same `host:/{path}` colon syntax as drive paths → same encoding.
+        site_url = (
+            f"/sites/{host}:{encode_drive_path(site_path)}"
+            if site_path
+            else f"/sites/{host}"
+        )
+        site_id = str((await self._request("GET", site_url)).json()["id"])
+        fields = ("id", "name", "webUrl", "driveType")
+        drives_url = f"/sites/{site_id}/drives?$select={','.join(fields)}"
+        drives = [
+            {k: d.get(k) for k in fields}
+            async for d in self._iter_paginated(drives_url)
+        ]
+        self._site_drives_cache[key] = (site_id, drives)
+        return site_id, drives
+
+    async def resolve_folder_url(self, url: str) -> DriveLocation:
+        """Resolve a browser-copied SharePoint/OneDrive folder link to its
+        drive and drive-relative folder path.
+
+        Accepts library views (``…/Forms/AllItems.aspx?id=…`` or
+        ``RootFolder=…``), direct folder URLs under ``/sites/``, ``/teams/``
+        or OneDrive ``/personal/{user}``, and sharing links (``/:f:/s|r|g/…``).
+
+        The library is matched by drive ``webUrl`` (longest prefix), never by
+        name — "Shared Documents" in the URL is named "Documents" (or a
+        localized name). Subsites are tried up to three levels deep. The
+        result is verified to be a folder.
+
+        For sharing links, ``folder_path`` is ``None`` when Graph returns the
+        item without a parent path; ``drive_id`` and ``item_id`` are always
+        set, and ``drive_name``/``drive_web_url`` are "" if the drive's
+        metadata is not readable with the caller's permissions.
+
+        Use the result with ``with_drive``::
+
+            loc = await client.resolve_folder_url(link)
+            files = await client.with_drive(loc.drive_id).walk(loc.folder_path)
+
+        Raises:
+            ValueError: the URL is not a supported SharePoint folder link, or
+                it points to a file.
+            NotFoundError: no site/library/folder matches the link.
+            AuthError / PermissionDeniedError: 401 / 403 from Graph.
+        """
+        parsed = parse_folder_url(url)
+        if parsed.kind == "share":
+            return await self._resolve_shared_folder(parsed.url)
+
+        tried: list[str] = []
+        for site_path in candidate_site_paths(parsed.segments):
+            tried.append(site_path)
+            try:
+                site_id, drives = await self._get_site_drives(parsed.host, site_path)
+            except NotFoundError:
+                break  # no site here → no deeper subsite either
+            match = match_drive(drives, parsed.host, parsed.segments)
+            if match is None:
+                continue
+
+            drive, folder_path = match
+            drive_id = str(drive["id"])
+            item_url = (
+                f"/drives/{drive_id}/root:/{encode_drive_path(folder_path)}"
+                if folder_path
+                else f"/drives/{drive_id}/root"
+            )
+            item = (await self._request("GET", item_url)).json()
+            _require_folder(item)
+            return DriveLocation(
+                drive_id=drive_id,
+                folder_path=folder_path,
+                item_id=str(item.get("id", "")),
+                drive_name=str(drive.get("name") or ""),
+                drive_web_url=str(drive.get("webUrl") or ""),
+                site_id=site_id,
+            )
+
+        request = httpx.Request("GET", f"{_GRAPH_BASE}/sites/{parsed.host}")
+        raise NotFoundError(
+            "No document library matches the folder link "
+            f"(sites tried: {', '.join(tried)})",
+            request=request,
+            response=httpx.Response(404, request=request),
+        )
+
+    async def _resolve_shared_folder(self, share_url: str) -> DriveLocation:
+        url = f"/shares/{encode_share_url(share_url)}/driveItem"
+        item = (await self._request("GET", url)).json()
+        _require_folder(item)
+
+        ref = item.get("parentReference", {})
+        drive_id = str(ref.get("driveId") or "")
+        if not drive_id:
+            raise ValueError("Graph returned no driveId for the sharing link")
+
+        drive_name = drive_web_url = ""
+        try:
+            drive_url = f"/drives/{drive_id}?$select=id,name,webUrl"
+            drive = (await self._request("GET", drive_url)).json()
+            drive_name = str(drive.get("name") or "")
+            drive_web_url = str(drive.get("webUrl") or "")
+        except (PermissionDeniedError, NotFoundError):
+            logger.info("Drive metadata not readable for shared folder")
+
+        return DriveLocation(
+            drive_id=drive_id,
+            folder_path=shared_item_folder_path(item),
+            item_id=str(item.get("id", "")),
+            drive_name=drive_name,
+            drive_web_url=drive_web_url,
+            site_id=ref.get("siteId"),
+        )
+
     async def upload(
         self, local_path: str | os.PathLike[str], remote_path: str
     ) -> dict[str, Any]:
@@ -1255,6 +1448,9 @@ class GraphClient:
 
     def download_sync(self, **kw: Any) -> "bytes | Path":
         return cast("bytes | Path", self._run_sync(self.download(**kw)))
+
+    def resolve_folder_url_sync(self, url: str) -> DriveLocation:
+        return self._run_sync(self.resolve_folder_url(url))
 
     def read_excel_many_sync(
         self, paths: list[str], **kw: Any

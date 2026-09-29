@@ -4,7 +4,12 @@ import pytest
 import httpx
 import respx
 import asyncio
-from gex_msgraph import GraphClient
+from gex_msgraph import (
+    DriveLocation,
+    GraphClient,
+    NotFoundError,
+    PermissionDeniedError,
+)
 
 
 async def test_init_missing_env(env_vars, monkeypatch):
@@ -40,11 +45,34 @@ async def test_init_app_only_when_username_and_password_absent(env_vars, monkeyp
     assert captured["called"]
 
 
-async def test_init_app_only_requires_default_drive_id(env_vars, monkeypatch):
+async def test_app_only_without_drive_fails_on_drive_scoped_call(
+    env_vars, mock_token, monkeypatch
+):
+    # Construction succeeds (resolve_folder_url needs no drive); only
+    # drive-scoped methods demand one.
     monkeypatch.delenv("MS_DAS_U1_USERNAME")
     monkeypatch.delenv("MS_DAS_U1_PASSWORD")
-    with pytest.raises(ValueError, match="default_drive_id"):
-        GraphClient("das_u1")
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(ValueError, match="default_drive_id"):
+            await client.list_files()
+        with pytest.raises(ValueError, match="with_drive"):
+            await client.download(item_path="a.txt")
+
+
+async def test_app_only_without_drive_allows_share_url(
+    env_vars, mock_token, mock_graph, monkeypatch
+):
+    monkeypatch.delenv("MS_DAS_U1_USERNAME")
+    monkeypatch.delenv("MS_DAS_U1_PASSWORD")
+    from gex_msgraph._files import encode_share_url
+
+    link = "https://contoso.sharepoint.com/:x:/s/A/tok"
+    mock_graph.get(f"/shares/{encode_share_url(link)}/driveItem").mock(
+        return_value=httpx.Response(200, json={"id": "i1", "name": "a.xlsx"})
+    )
+    async with GraphClient("das_u1") as client:
+        item = await client.get_metadata(share_url=link)
+    assert item.id == "i1"
 
 
 async def test_init_ropc_uses_username_password_flow(env_vars, monkeypatch):
@@ -1308,3 +1336,349 @@ async def test_move_file_encodes_special_characters_in_dest(env_vars, mock_token
     payload = route.calls[0].request.read().decode()
     assert "Dest%20%231" in payload
     assert "Dest #1" not in payload
+
+
+# --- with_drive -----------------------------------------------------------
+
+
+async def test_with_drive_shares_resources_and_scopes_urls(
+    env_vars, mock_token, mock_graph
+):
+    route = mock_graph.get("/drives/b!other/root:/Reports:/children").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    async with GraphClient("das_u1") as client:
+        child = client.with_drive("b!other")
+        assert child._client is client._client
+        assert child._provider is client._provider
+        assert child._semaphore is client._semaphore
+        assert client._drive_root() == "/me/drive"  # owner unchanged
+        assert await child.list_files("Reports") == []
+        # Closing the child must not close the shared httpx client.
+        await child.close()
+        assert not client._client.is_closed
+        assert await child.with_drive("b!other").list_files("Reports") == []
+    assert client._client.is_closed
+    assert route.call_count == 2
+
+
+async def test_with_drive_rejects_empty_id(env_vars, mock_token):
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(ValueError):
+            client.with_drive("")
+
+
+def test_with_drive_sync_methods_use_owner_loop(env_vars, mock_token):
+    with respx.mock(base_url="https://graph.microsoft.com/v1.0") as rm:
+        rm.get("/drives/b!x/root:/f.txt").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://dl.example/f"}
+            )
+        )
+        rm.get("/me/drive/root:/g.txt").mock(
+            return_value=httpx.Response(
+                200, json={"@microsoft.graph.downloadUrl": "https://dl.example/g"}
+            )
+        )
+        rm.get("https://dl.example/f").mock(return_value=httpx.Response(200, content=b"f"))
+        rm.get("https://dl.example/g").mock(return_value=httpx.Response(200, content=b"g"))
+
+        client = GraphClient("das_u1")
+        child = client.with_drive("b!x")
+        assert child.download_sync(item_path="f.txt") == b"f"
+        assert client.download_sync(item_path="g.txt") == b"g"
+        assert child._sync_loop is None  # child never owns a loop
+        child.close_sync()  # no-op
+        assert client.download_sync(item_path="g.txt") == b"g"
+        client.close_sync()
+        assert client._client.is_closed
+
+
+# --- list_site_drives / resolve_folder_url -------------------------------
+
+HOST = "contoso.sharepoint.com"
+SITE_ID = "contoso.sharepoint.com,guid-1,guid-2"
+VN = "08. Ứng dụng - Công cụ KTNB"
+VN_ENC = "08.%20%E1%BB%A8ng%20d%E1%BB%A5ng%20-%20C%C3%B4ng%20c%E1%BB%A5%20KTNB"
+
+
+def _mock_site(router, site_path, drives, site_id=SITE_ID):
+    site = router.get(f"/sites/{HOST}:{site_path}").mock(
+        return_value=httpx.Response(200, json={"id": site_id})
+    )
+    router.get(f"/sites/{site_id}/drives").mock(
+        return_value=httpx.Response(200, json={"value": drives})
+    )
+    return site
+
+
+def _drive(drive_id, name, lib_url_path):
+    return {
+        "id": drive_id,
+        "name": name,
+        "webUrl": f"https://{HOST}{lib_url_path}",
+        "driveType": "documentLibrary",
+        "createdBy": {"ignored": True},
+    }
+
+
+async def test_list_site_drives(env_vars, mock_token, mock_graph):
+    site = _mock_site(
+        mock_graph,
+        "/sites/Audit",
+        [_drive("d1", "Documents", "/sites/Audit/Shared%20Documents")],
+    )
+    async with GraphClient("das_u1") as client:
+        drives = await client.list_site_drives(f"https://{HOST}/sites/Audit/")
+        again = await client.list_site_drives(f"https://{HOST}/sites/Audit")
+    assert drives == again == [
+        {
+            "id": "d1",
+            "name": "Documents",
+            "webUrl": f"https://{HOST}/sites/Audit/Shared%20Documents",
+            "driveType": "documentLibrary",
+        }
+    ]
+    assert site.call_count == 1  # cached
+
+
+async def test_resolve_view_link_picks_longest_prefix(env_vars, mock_token, mock_graph):
+    _mock_site(
+        mock_graph,
+        "/sites/Audit",
+        [
+            _drive("d-docs", "Documents", "/sites/Audit/Documents"),
+            _drive("d-arch", "Documents Archive", "/sites/Audit/Documents%20Archive"),
+        ],
+    )
+    verify = mock_graph.get("/drives/d-arch/root:/2024/Q1").mock(
+        return_value=httpx.Response(200, json={"id": "folder-1", "folder": {}})
+    )
+    url = (
+        f"https://{HOST}/sites/Audit/Documents%20Archive/Forms/AllItems.aspx"
+        "?id=%2Fsites%2FAudit%2FDocuments%20Archive%2F2024%2FQ1&viewid=v1&OR=Teams"
+    )
+    async with GraphClient("das_u1") as client:
+        loc = await client.resolve_folder_url(url)
+    assert loc == DriveLocation(
+        drive_id="d-arch",
+        folder_path="2024/Q1",
+        item_id="folder-1",
+        drive_name="Documents Archive",
+        drive_web_url=f"https://{HOST}/sites/Audit/Documents%20Archive",
+        site_id=SITE_ID,
+    )
+    assert verify.called
+
+
+async def test_resolve_matches_web_url_not_name_and_encodes_vietnamese(
+    env_vars, mock_token, mock_graph
+):
+    _mock_site(
+        mock_graph,
+        "/sites/Audit",
+        [_drive("d1", "Tài liệu", "/sites/Audit/Shared%20Documents")],
+    )
+    verify = mock_graph.get(f"/drives/d1/root:/{VN_ENC}/Sub%20A").mock(
+        return_value=httpx.Response(200, json={"id": "f", "folder": {}})
+    )
+    async with GraphClient("das_u1") as client:
+        loc = await client.resolve_folder_url(
+            f"https://{HOST}/sites/Audit/Shared%20Documents/{VN_ENC}/Sub%20A/"
+        )
+    assert loc.folder_path == f"{VN}/Sub A"
+    assert loc.drive_name == "Tài liệu"
+    assert verify.called
+
+
+async def test_resolve_library_root(env_vars, mock_token, mock_graph):
+    _mock_site(
+        mock_graph,
+        "/teams/Risk",
+        [_drive("d1", "Documents", "/teams/Risk/Shared%20Documents")],
+    )
+    mock_graph.get("/drives/d1/root").mock(
+        return_value=httpx.Response(
+            200, json={"id": "root-id", "folder": {}, "root": {}}
+        )
+    )
+    async with GraphClient("das_u1") as client:
+        loc = await client.resolve_folder_url(
+            f"https://{HOST}/teams/Risk/Shared%20Documents/Forms/AllItems.aspx"
+        )
+    assert (loc.drive_id, loc.folder_path, loc.item_id) == ("d1", "", "root-id")
+
+
+async def test_resolve_subsite(env_vars, mock_token, mock_graph):
+    # Parent site has no library matching "Sub/...", the subsite does.
+    parent = _mock_site(
+        mock_graph, "/sites/A", [_drive("dp", "Documents", "/sites/A/Shared%20Documents")]
+    )
+    _mock_site(
+        mock_graph,
+        "/sites/A/Sub",
+        [_drive("ds", "Documents", "/sites/A/Sub/Shared%20Documents")],
+        site_id="sub-site-id",
+    )
+    mock_graph.get("/drives/ds/root:/X").mock(
+        return_value=httpx.Response(200, json={"id": "fx", "folder": {}})
+    )
+    async with GraphClient("das_u1") as client:
+        loc = await client.resolve_folder_url(
+            f"https://{HOST}/sites/A/Sub/Shared%20Documents/X"
+        )
+    assert (loc.drive_id, loc.folder_path, loc.site_id) == ("ds", "X", "sub-site-id")
+    assert parent.called
+
+
+async def test_resolve_reuses_site_cache(env_vars, mock_token, mock_graph):
+    site = _mock_site(mock_graph, "/sites/A", [_drive("d1", "Documents", "/sites/A/Docs")])
+    mock_graph.get("/drives/d1/root:/X").mock(
+        return_value=httpx.Response(200, json={"id": "1", "folder": {}})
+    )
+    mock_graph.get("/drives/d1/root:/Y").mock(
+        return_value=httpx.Response(200, json={"id": "2", "folder": {}})
+    )
+    async with GraphClient("das_u1") as client:
+        await client.resolve_folder_url(f"https://{HOST}/sites/A/Docs/X")
+        await client.resolve_folder_url(f"https://{HOST}/sites/a/docs/Y")
+    assert site.call_count == 1
+
+
+async def test_resolve_file_link_raises_value_error(env_vars, mock_token, mock_graph):
+    _mock_site(mock_graph, "/sites/A", [_drive("d1", "Documents", "/sites/A/Docs")])
+    mock_graph.get("/drives/d1/root:/report.xlsx").mock(
+        return_value=httpx.Response(200, json={"id": "1", "file": {}})
+    )
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(ValueError, match="file, not a folder"):
+            await client.resolve_folder_url(f"https://{HOST}/sites/A/Docs/report.xlsx")
+
+
+async def test_resolve_missing_folder_raises_not_found(env_vars, mock_token, mock_graph):
+    _mock_site(mock_graph, "/sites/A", [_drive("d1", "Documents", "/sites/A/Docs")])
+    mock_graph.get("/drives/d1/root:/Gone").mock(return_value=httpx.Response(404))
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(NotFoundError):
+            await client.resolve_folder_url(f"https://{HOST}/sites/A/Docs/Gone")
+
+
+async def test_resolve_unknown_site_or_library_raises_not_found(
+    env_vars, mock_token, mock_graph
+):
+    mock_graph.get(f"/sites/{HOST}:/sites/Nope").mock(return_value=httpx.Response(404))
+    _mock_site(mock_graph, "/sites/A", [_drive("d1", "Documents", "/sites/A/Docs")])
+    mock_graph.get(f"/sites/{HOST}:/sites/A/Other").mock(
+        return_value=httpx.Response(404)
+    )
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(NotFoundError):
+            await client.resolve_folder_url(f"https://{HOST}/sites/Nope/Docs/X")
+        with pytest.raises(NotFoundError, match="sites tried"):
+            await client.resolve_folder_url(f"https://{HOST}/sites/A/Other/X")
+
+
+async def test_resolve_forbidden_site_raises_permission_denied(
+    env_vars, mock_token, mock_graph
+):
+    mock_graph.get(f"/sites/{HOST}:/sites/Secret").mock(
+        return_value=httpx.Response(403)
+    )
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(PermissionDeniedError):
+            await client.resolve_folder_url(f"https://{HOST}/sites/Secret/Docs/X")
+
+
+async def test_resolve_rejects_garbage_url(env_vars, mock_token):
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(ValueError, match="Supported SharePoint folder links"):
+            await client.resolve_folder_url("https://example.com/whatever")
+
+
+SHARE_LINK = f"https://{HOST}/:f:/s/Audit/EaSECRETtoken123?e=AbCd"
+
+
+def _share_id(link):
+    b64 = base64.urlsafe_b64encode(link.encode()).decode().rstrip("=")
+    return f"u!{b64}"
+
+
+async def test_resolve_sharing_link_with_path(env_vars, mock_token, mock_graph):
+    mock_graph.get(f"/shares/{_share_id(SHARE_LINK)}/driveItem").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "fid",
+                "name": "Q1",
+                "folder": {"childCount": 3},
+                "parentReference": {
+                    "driveId": "d1",
+                    "siteId": SITE_ID,
+                    "path": f"/drives/d1/root:/{VN_ENC}",
+                },
+            },
+        )
+    )
+    web_url = f"https://{HOST}/sites/Audit/Shared%20Documents"
+    mock_graph.get("/drives/d1").mock(
+        return_value=httpx.Response(
+            200, json={"id": "d1", "name": "Documents", "webUrl": web_url}
+        )
+    )
+    async with GraphClient("das_u1") as client:
+        loc = await client.resolve_folder_url(SHARE_LINK)
+    assert loc == DriveLocation(
+        drive_id="d1",
+        folder_path=f"{VN}/Q1",
+        item_id="fid",
+        drive_name="Documents",
+        drive_web_url=web_url,
+        site_id=SITE_ID,
+    )
+
+
+async def test_resolve_sharing_link_without_path(env_vars, mock_token, mock_graph):
+    mock_graph.get(f"/shares/{_share_id(SHARE_LINK)}/driveItem").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "fid",
+                "name": "Q1",
+                "folder": {},
+                "parentReference": {"driveId": "d1"},
+            },
+        )
+    )
+    mock_graph.get("/drives/d1").mock(return_value=httpx.Response(403))
+    async with GraphClient("das_u1") as client:
+        loc = await client.resolve_folder_url(SHARE_LINK)
+    assert (loc.drive_id, loc.item_id, loc.folder_path) == ("d1", "fid", None)
+    assert (loc.drive_name, loc.drive_web_url, loc.site_id) == ("", "", None)
+
+
+async def test_resolve_sharing_link_error_hides_token(
+    env_vars, mock_token, mock_graph, caplog
+):
+    mock_graph.get(f"/shares/{_share_id(SHARE_LINK)}/driveItem").mock(
+        return_value=httpx.Response(403)
+    )
+    caplog.set_level("DEBUG", logger="gex_msgraph")
+    async with GraphClient("das_u1") as client:
+        with pytest.raises(PermissionDeniedError) as exc:
+            await client.resolve_folder_url(SHARE_LINK)
+    for text in (str(exc.value), caplog.text):
+        assert "SECRET" not in text
+        assert _share_id(SHARE_LINK) not in text
+    assert "/shares/<redacted>/driveItem" in str(exc.value)
+
+
+def test_resolve_folder_url_sync(env_vars, mock_token):
+    with respx.mock(base_url="https://graph.microsoft.com/v1.0") as rm:
+        _mock_site(rm, "/sites/A", [_drive("d1", "Documents", "/sites/A/Docs")])
+        rm.get("/drives/d1/root:/X").mock(
+            return_value=httpx.Response(200, json={"id": "1", "folder": {}})
+        )
+        client = GraphClient("das_u1")
+        loc = client.resolve_folder_url_sync(url=f"https://{HOST}/sites/A/Docs/X")
+        client.close_sync()
+    assert (loc.drive_id, loc.folder_path) == ("d1", "X")

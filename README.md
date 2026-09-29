@@ -2,7 +2,7 @@
 
 Async Python wrapper around Microsoft Graph API for clean access to M365 (SharePoint, OneDrive, Outlook, Teams) from any context — FastAPI, Prefect, scripts, notebooks.
 
-**Status:** v0.4.1 | Python >=3.11 | Internal/Private
+**Status:** v0.5.0 | Python >=3.11 | Internal/Private
 
 ## Quickstart
 
@@ -21,6 +21,21 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Working from a SharePoint folder link
+
+Paste the folder link copied from the browser — no drive ID lookup in Graph
+Explorer, no `DEFAULT_DRIVE_ID` env var:
+
+```python
+async with GraphClient("das_u1") as client:
+    loc = await client.resolve_folder_url(link_copied_from_browser)
+    files = await client.with_drive(loc.drive_id).walk(loc.folder_path)
+```
+
+Accepts library views (`…/Forms/AllItems.aspx?id=…`), direct folder URLs
+(`/sites/…`, `/teams/…`, OneDrive `/personal/…`) and sharing links
+(`/:f:/s/…`). `with_drive` reuses the same sign-in and HTTP connection pool.
+
 ## Documentation
 
 - **[USAGE.md](USAGE.md)** — installation, setup, recipes, API reference, and deployment.
@@ -33,6 +48,20 @@ See **[CLAUDE.md](CLAUDE.md)** for architecture, invariants, and development wor
 Bump `__version__` in `__init__.py`, update the Changelog below, `git tag v0.X.Y`, `git push --tags`.
 
 ## Changelog
+
+### [0.5.0] - 2026-09-29
+
+#### Added
+- **`resolve_folder_url(url)` / `resolve_folder_url_sync(url)`** → `DriveLocation(drive_id, folder_path, item_id, drive_name, drive_web_url, site_id)` from a browser-copied SharePoint/OneDrive folder link: library views (`id=` / `RootFolder=`), direct folder URLs under `/sites/`, `/teams/`, `/personal/`, subsites (up to 3 levels) and sharing links (`/:f:/s|r|g/`). The library is matched by drive `webUrl` (longest segment-wise prefix, Unicode-NFC, case-insensitive), never by name — so "Shared Documents" vs "Documents"/"Tài liệu" and "Documents" vs "Documents Archive" resolve correctly. The target is verified to be a folder. Site → drives lookups are cached per client.
+- **`list_site_drives(site_url)`** — a site's document libraries (`id`, `name`, `webUrl`, `driveType`).
+- **`with_drive(drive_id)`** — a client scoped to `/drives/{drive_id}` that shares the token provider, httpx client, semaphore and sync loop of its owner. Closing it is a no-op; the owner closes the shared resources.
+- `DriveLocation` exported from the package.
+
+#### Changed
+- **App-only auth no longer requires `default_drive_id` at construction.** The `ValueError` moved from `GraphClient(...)` to the first drive-scoped call (`list_files`, `walk`, `download(item_path=…)`, …), so app-only clients can resolve links and use `with_drive`. `share_url=` identifiers never need a drive.
+
+#### Fixed
+- **Sharing-link tokens no longer leak into logs/exceptions.** `/shares/u!…` segments (base64 of the sharing link, token included) are redacted in `_request` log lines and `GraphError` messages; `download`'s "could not resolve download URL" error no longer echoes `share_url`.
 
 ### [0.4.1] - 2026-07-30
 

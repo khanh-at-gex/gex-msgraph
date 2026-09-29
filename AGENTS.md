@@ -2,7 +2,7 @@
 
 > Async Python wrapper for Microsoft Graph API. Provides clean access to M365 services (OneDrive, SharePoint, Outlook, Teams) from scripts, FastAPI, Prefect, or Jupyter notebooks.
 
-Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode, GraphError, AuthError, PermissionDeniedError, NotFoundError, RateLimitExhaustedError, GraphAuthenticationError, GraphSyncInLoopError`
+Public exports: `from gex_msgraph import GraphClient, FileItem, TreeNode, DriveLocation, GraphError, AuthError, PermissionDeniedError, NotFoundError, RateLimitExhaustedError, GraphAuthenticationError, GraphSyncInLoopError`
 
 ## Setup
 
@@ -18,7 +18,7 @@ MS_DAS_U1_CLIENT_SECRET=...
 MS_DAS_U1_TENANT_ID=...
 MS_DAS_U1_USERNAME=service@company.com   # omit BOTH username+password for app-only auth
 MS_DAS_U1_PASSWORD=...
-MS_DAS_U1_DEFAULT_DRIVE_ID=...   # optional (required for app-only auth)
+MS_DAS_U1_DEFAULT_DRIVE_ID=...   # optional (app-only: set it, or use with_drive())
 ```
 
 Load env in code (`python-dotenv` is no longer bundled since v0.3.0 — add it to your own project, or install `gex-msgraph[dotenv]`):
@@ -34,7 +34,7 @@ load_dotenv()
 - Exactly one of `item_path`, `share_url`, or `item_id` must be provided per call.
 - `item_path` is always relative to the drive root, e.g. `"Reports/Q1.xlsx"` (no leading slash).
 - All Graph HTTP errors raise a `GraphError` subclass (`AuthError` 401, `PermissionDeniedError` 403, `NotFoundError` 404, `RateLimitExhaustedError` when retries run out). `GraphError` subclasses `httpx.HTTPStatusError`, so old `except httpx.HTTPStatusError` code still works.
-- App-only auth (no username/password): only drive operations work, and `default_drive_id` is required. Mail/Teams/chat methods need delegated (username+password) auth.
+- App-only auth (no username/password): only drive operations work, and they need a drive — `default_drive_id` or `client.with_drive(drive_id)` (checked on first drive call since v0.5.0). Mail/Teams/chat methods need delegated (username+password) auth.
 - Since v0.4.0, `read_excel`/`read_excel_many` auto-detect **SpreadsheetML 2003** files (SAP exports named `.xls` that are really UTF-16 XML) and decode them. Values only — styles/formulas dropped, `DateTime` cells arrive as strings. Sheet names illegal in xlsx (`\ / * ? : [ ]`, or >31 chars) are renamed on conversion; pass `sheet` as it appears in the source and it is mapped for you, except with `sheet_match="glob"` where the pattern is used verbatim. `list_excel_sheets` does **not** work on them (Graph workbook API needs a real xlsx; returns 403).
 
 ## GraphClient — instantiation
@@ -113,6 +113,19 @@ files = await client.search_files("budget")          # → list[FileItem]
 ```python
 df = client.read_excel_many_sync(["jan.xlsx", "feb.xlsx"], sheet="Sales")
 df = client.read_csv_many_sync(["jan.csv", "feb.csv"])
+```
+
+## Folder link from the browser → drive
+
+```python
+# Paste any SharePoint folder link (library view, /sites|/teams|/personal path, /:f:/ sharing link)
+loc = await client.resolve_folder_url(link)
+# loc.drive_id, loc.folder_path ("" = library root), loc.item_id, loc.drive_name, loc.site_id
+docs = client.with_drive(loc.drive_id)      # shares sign-in + connections; don't close it
+files = await docs.walk(loc.folder_path, pattern="*.xlsx")
+
+# A site's libraries
+drives = await client.list_site_drives("https://tenant.sharepoint.com/sites/Audit")
 ```
 
 ## File & folder discovery
@@ -219,6 +232,7 @@ client = GraphClient("das_u1")
 df   = client.read_excel_sync(item_path="Reports/Q1.xlsx")
 df   = client.read_csv_sync(item_path="data.csv")
 data = client.download_sync(item_path="image.png")
+loc  = client.resolve_folder_url_sync(url="https://tenant.sharepoint.com/sites/...")
 client.close_sync()  # when done
 ```
 

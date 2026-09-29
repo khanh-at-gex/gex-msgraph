@@ -98,3 +98,144 @@ def test_parse_drive_item():
     assert fi2.is_folder
     assert fi2.path == "Reports/EmptyFolder"
     assert fi2.webUrl is None
+
+
+# --- parse_folder_url / match_drive -------------------------------------
+
+from gex_msgraph._files import (  # noqa: E402
+    candidate_site_paths,
+    match_drive,
+    parse_folder_url,
+    shared_item_folder_path,
+)
+
+VN_FOLDER = "08. Ứng dụng - Công cụ KTNB"
+VN_ENCODED = "08.%20%E1%BB%A8ng%20d%E1%BB%A5ng%20-%20C%C3%B4ng%20c%E1%BB%A5%20KTNB"
+
+
+def test_parse_view_link_id_param():
+    url = (
+        "https://contoso.sharepoint.com/sites/Audit/Shared%20Documents/Forms/"
+        "AllItems.aspx?id=%2Fsites%2FAudit%2FShared%20Documents%2F"
+        f"{VN_ENCODED}%2FSub&viewid=abc-123&FolderCTID=0x0120"
+    )
+    parsed = parse_folder_url(url)
+    assert parsed.kind == "path"
+    assert parsed.host == "contoso.sharepoint.com"
+    assert parsed.segments == ("sites", "Audit", "Shared Documents", VN_FOLDER, "Sub")
+
+
+def test_parse_view_link_rootfolder_param():
+    url = (
+        "https://contoso.sharepoint.com/sites/Audit/Shared%20Documents/Forms/"
+        "AllItems.aspx?RootFolder=%2Fsites%2FAudit%2FShared%20Documents%2FA&at=1"
+    )
+    assert parse_folder_url(url).segments == ("sites", "Audit", "Shared Documents", "A")
+
+
+def test_parse_bare_library_view_points_at_library_root():
+    url = "https://contoso.sharepoint.com/sites/Audit/Shared%20Documents/Forms/AllItems.aspx"
+    assert parse_folder_url(url).segments == ("sites", "Audit", "Shared Documents")
+
+
+@pytest.mark.parametrize("suffix", ["", "/"])
+def test_parse_direct_folder_link(suffix):
+    url = f"https://contoso.sharepoint.com/sites/Audit/Shared%20Documents/{VN_ENCODED}{suffix}"
+    parsed = parse_folder_url(url)
+    assert parsed.segments == ("sites", "Audit", "Shared Documents", VN_FOLDER)
+    assert parsed.url == f"https://contoso.sharepoint.com/sites/Audit/Shared Documents/{VN_FOLDER}"
+
+
+def test_parse_teams_and_personal_links():
+    teams = parse_folder_url("https://contoso.sharepoint.com/teams/Risk/Documents/A%20B")
+    assert teams.segments == ("teams", "Risk", "Documents", "A B")
+    personal = parse_folder_url(
+        "https://contoso-my.sharepoint.com/personal/user_contoso_com/Documents/Reports"
+    )
+    assert personal.host == "contoso-my.sharepoint.com"
+    assert personal.segments[:2] == ("personal", "user_contoso_com")
+
+
+def test_parse_normalizes_to_nfc():
+    import unicodedata
+
+    nfd = unicodedata.normalize("NFD", VN_FOLDER)
+    parsed = parse_folder_url(f"https://contoso.sharepoint.com/sites/A/Docs/{nfd}")
+    assert parsed.segments[-1] == VN_FOLDER
+
+
+@pytest.mark.parametrize("kind", ["f", "r", "g"])
+def test_parse_sharing_link(kind):
+    url = f"https://contoso.sharepoint.com/:f:/{kind}/Audit/EaBcToken?e=xyz"
+    parsed = parse_folder_url(url)
+    assert parsed.kind == "share"
+    assert parsed.url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "not a url",
+        "https://example.com/sites/A/Docs/x",
+        "ftp://contoso.sharepoint.com/sites/A/Docs",
+        "https://contoso.sharepoint.com/sites/A",
+        "https://contoso.sharepoint.com/Shared%20Documents/x",
+        "",
+    ],
+)
+def test_parse_rejects_garbage(url):
+    with pytest.raises(ValueError, match="Supported SharePoint folder links"):
+        parse_folder_url(url)
+
+
+def test_parse_error_never_echoes_url():
+    secret = "https://evil.example.com/:f:/s/Audit/SECRETTOKEN"
+    with pytest.raises(ValueError) as exc:
+        parse_folder_url(secret)
+    assert "SECRETTOKEN" not in str(exc.value)
+
+
+def test_candidate_site_paths():
+    assert candidate_site_paths(("sites", "A", "Docs")) == ["/sites/A"]
+    assert candidate_site_paths(("sites", "A", "B", "C", "D", "E", "F")) == [
+        "/sites/A",
+        "/sites/A/B",
+        "/sites/A/B/C",
+    ]
+
+
+def _drive(name, web_url):
+    return {"id": f"id-{name}", "name": name, "webUrl": web_url}
+
+
+def test_match_drive_longest_prefix_and_segment_boundary():
+    base = "https://contoso.sharepoint.com/sites/A"
+    docs = _drive("Documents", f"{base}/Documents")
+    archive = _drive("Documents Archive", f"{base}/Documents%20Archive")
+    segs = ("sites", "A", "Documents Archive", "2024")
+
+    assert match_drive([docs, archive], "contoso.sharepoint.com", segs) == (archive, "2024")
+    # Only "Documents" visible: a string prefix, not a segment prefix — no match.
+    assert match_drive([docs], "contoso.sharepoint.com", segs) is None
+
+
+def test_match_drive_uses_web_url_not_name():
+    drive = _drive("Documents", "https://contoso.sharepoint.com/sites/A/Shared%20Documents/")
+    segs = ("sites", "A", "shared documents", VN_FOLDER)
+    assert match_drive([drive], "contoso.sharepoint.com", segs) == (drive, VN_FOLDER)
+
+
+def test_match_drive_library_root_and_other_host():
+    drive = _drive("Documents", "https://contoso.sharepoint.com/sites/A/Shared%20Documents")
+    segs = ("sites", "A", "Shared Documents")
+    assert match_drive([drive], "contoso.sharepoint.com", segs) == (drive, "")
+    assert match_drive([drive], "other.sharepoint.com", segs) is None
+
+
+def test_shared_item_folder_path():
+    item = {"name": "Q1", "parentReference": {"path": "/drives/b!x/root:/A%20B/C"}}
+    assert shared_item_folder_path(item) == "A B/C/Q1"
+    top = {"name": "Q1", "parentReference": {"path": "/drives/b!x/root:"}}
+    assert shared_item_folder_path(top) == "Q1"
+    assert shared_item_folder_path({"name": "Q1", "parentReference": {}}) is None
+    assert shared_item_folder_path({"name": "root", "root": {}}) == ""

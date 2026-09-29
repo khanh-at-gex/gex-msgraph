@@ -28,6 +28,11 @@ gex-msgraph
 │   │   └── SpreadsheetML 2003  auto-detected + decoded by read_excel(_many)
 │   │                           (SAP ".xls" = UTF-16 XML) · values only
 │   │
+│   ├── Folder links
+│   │   ├── resolve_folder_url(url)           → DriveLocation  (view / path / sharing link)
+│   │   ├── list_site_drives(site_url)        → [{id, name, webUrl, driveType}]
+│   │   └── with_drive(drive_id)              → GraphClient  (shared auth + pool)
+│   │
 │   ├── Discovery
 │   │   ├── list_files(folder_path)           immediate children, files + folders
 │   │   ├── walk(folder_path, *, pattern, recursive)   files only, fnmatch glob
@@ -54,6 +59,7 @@ gex-msgraph
 │       ├── read_excel_sync(**kwargs)
 │       ├── read_csv_sync(**kwargs)
 │       ├── download_sync(**kwargs)
+│       ├── resolve_folder_url_sync(url)
 │       ├── read_excel_many_sync(paths, **kwargs)
 │       ├── read_csv_many_sync(paths, **kwargs)
 │       └── close_sync()
